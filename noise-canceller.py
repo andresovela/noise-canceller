@@ -15,11 +15,11 @@ from rich.console import Console
 from rich.logging import RichHandler
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
 from rich.panel import Panel
-from rich.text import Text
 from rich.table import Table
-from rich import print as rprint
 
 from livekit import rtc, api
+from livekit.agents import AgentServer, AutoSubscribe, JobContext
+from livekit.agents.job import JobExecutorType
 from livekit.plugins import noise_cancellation
 from dotenv import load_dotenv
 
@@ -36,6 +36,7 @@ console = Console()
 # Set up logger with Rich
 logger = logging.getLogger("noise-canceller")
 
+
 class NullConsole:
     """A console that suppresses all output for silent mode"""
     def print(self, *args, **kwargs):
@@ -47,6 +48,7 @@ class NullConsole:
     def print_exception(self, *args, **kwargs):
         pass
 
+
 class NullContext:
     """A context manager that does nothing"""
     def __enter__(self):
@@ -54,6 +56,7 @@ class NullContext:
     
     def __exit__(self, *args):
         pass
+
 
 class NullProgress:
     """A progress tracker that does nothing for silent mode"""
@@ -73,13 +76,65 @@ class NullProgress:
     def update(self, *args, **kwargs):
         pass
 
+
+_config: dict = {}
+
+server = AgentServer(job_executor_type=JobExecutorType.THREAD)
+
+
+@server.rtc_session()
+async def entrypoint(ctx: JobContext):
+    """Agent entrypoint — processes the file then exits the process."""
+    exit_code = 0
+    try:
+        await ctx.connect(auto_subscribe=AutoSubscribe.SUBSCRIBE_NONE)
+
+        processor = AudioFileProcessor(
+            noise_filter=_config["noise_filter"],
+            use_webrtc=_config["use_webrtc"],
+            silent=_config["silent"],
+        )
+        processor.room = ctx.room
+        await processor.process_file(
+            Path(_config["input_file"]),
+            Path(_config["output"]),
+        )
+
+        if not _config["silent"]:
+            # Final success message
+            processing_type = "WebRTC" if _config["use_webrtc"] else "LiveKit Enhanced"
+            final_panel = Panel.fit(
+                "🎉 [bold green]All Done![/bold green]\n"
+                f"[dim]Your {processing_type} noise-cancelled audio is ready at:[/dim]\n"
+                f"[cyan]{_config['output']}[/cyan]",
+                style="green"
+            )
+            console.print()
+            console.print(final_panel)
+
+    except Exception as e:
+        exit_code = 1
+        if not _config.get("silent"):
+            error_panel = Panel.fit(
+                f"💥 [bold red]Processing Failed[/bold red]\n\n"
+                f"[dim]Error details:[/dim]\n"
+                f"[red]{e}[/red]",
+                style="red"
+            )
+            console.print(error_panel)
+        else:
+            sys.stderr.write(f"ERROR: Processing failed - {e}\n")
+    finally:
+        ctx.shutdown("processing complete")
+        os._exit(exit_code)
+
+
 class AudioFileProcessor:
     def __init__(self, noise_filter, use_webrtc=False, silent=False):
         self.noise_filter = noise_filter
         self.use_webrtc = use_webrtc
         self.processed_frames = []
-        self.room = None
-        self.progress = None
+        self.room: rtc.Room | None = None
         self.silent = silent
 
     async def process_file(self, input_path: Path, output_path: Path):
@@ -115,36 +170,26 @@ class AudioFileProcessor:
         # Load the input audio file
         with console.status("[bold green]Loading audio file...", spinner="dots"):
             audio_data = self._load_audio_file(input_path)
+
+        if self.use_webrtc:
+            # Process with WebRTC AudioProcessingModule
+            await self._process_with_webrtc_apm(audio_data)
+        else:
+            # Process with LiveKit enhanced noise cancellation
+            await self._process_with_noise_cancellation(audio_data)
         
-        # Connect to LiveKit room (required for authentication)
-        with console.status("[bold blue]Connecting to LiveKit Cloud...", spinner="dots"):
-            self.room = await self._connect_to_room()
+        # Save the processed audio
+        with console.status("[bold green]Saving processed audio...", spinner="dots"):
+            self._save_output(output_path)
         
-        try:
-            if self.use_webrtc:
-                # Process with WebRTC AudioProcessingModule
-                await self._process_with_webrtc_apm(audio_data)
-            else:
-                # Process with LiveKit enhanced noise cancellation
-                await self._process_with_noise_cancellation(audio_data)
-            
-            # Save the processed audio
-            with console.status("[bold green]Saving processed audio...", spinner="dots"):
-                self._save_output(output_path)
-            
-            if not self.silent:
-                # Success message
-                success_panel = Panel.fit(
-                    f"✅ [bold green]Processing Complete![/bold green]\n"
-                    f"[dim]Clean audio saved to: {output_path}[/dim]",
-                    style="green"
-                )
-                console.print(success_panel)
-            
-        finally:
-            if self.room:
-                await self.room.disconnect()
-                logger.debug("Disconnected from LiveKit room")
+        if not self.silent:
+            # Success message
+            success_panel = Panel.fit(
+                f"✅ [bold green]Processing Complete![/bold green]\n"
+                f"[dim]Clean audio saved to: {output_path}[/dim]",
+                style="green"
+            )
+            console.print(success_panel)
 
     async def _process_with_webrtc_apm(self, audio_data):
         """Process audio data using WebRTC AudioProcessingModule"""
@@ -196,10 +241,8 @@ class AudioFileProcessor:
                 
                 # Process frame in-place with WebRTC APM
                 apm.process_stream(audio_frame)
-                
                 # Store processed frame
                 self.processed_frames.append(audio_frame.data.tobytes())
-                
                 # Update progress
                 progress.update(process_task, advance=1)
             
@@ -289,18 +332,17 @@ class AudioFileProcessor:
     async def _feed_audio_data_with_progress(self, file_source, audio_data, chunk_count, progress, task_id):
         """Feed audio data to the source with precise timing and progress updates"""
         chunk_duration = SAMPLES_PER_CHUNK / SAMPLERATE
-        start_time = asyncio.get_event_loop().time()
+        loop = asyncio.get_running_loop()
+        start_time = loop.time()
         
         for i in range(chunk_count):
             start_idx = i * SAMPLES_PER_CHUNK
             end_idx = min(start_idx + SAMPLES_PER_CHUNK, len(audio_data))
             chunk = audio_data[start_idx:end_idx]
             
-            # Pad last chunk if necessary with silence
             if len(chunk) < SAMPLES_PER_CHUNK:
                 chunk = np.concatenate([chunk, np.zeros(SAMPLES_PER_CHUNK - len(chunk), dtype=np.int16)])
             
-            # Create audio frame
             audio_frame = rtc.AudioFrame(
                 data=chunk.tobytes(),
                 sample_rate=SAMPLERATE,
@@ -308,15 +350,11 @@ class AudioFileProcessor:
                 samples_per_channel=len(chunk)
             )
             
-            # Feed to source
             await file_source.capture_frame(audio_frame)
-            
-            # Update progress
             progress.update(task_id, advance=1)
             
-            # Precise timing
             target_time = start_time + (i + 1) * chunk_duration
-            current_time = asyncio.get_event_loop().time()
+            current_time = loop.time()
             delay = max(0, target_time - current_time)
             
             if delay > 0:
@@ -324,25 +362,17 @@ class AudioFileProcessor:
 
     async def _show_publication_info(self, publication):
         """Show simple track publication info"""
-        try:
-            if publication:
-                console.print(f"✅ [green]Track published: [bold]{publication.name}[/bold] (SID: {publication.sid})[/green]")
-                console.print(f"🏠 [cyan]Room: {self.room.name or 'noise-canceller-room'}[/cyan]")
-                console.print()  # Add blank line for clean output
-                logger.info(f"Track '{publication.name}' published with SID: {publication.sid}")
-            else:
-                console.print("❌ [red]Failed to publish track to room[/red]")
-                raise Exception("Track publication failed")
-                
-        except Exception as e:
-            console.print(f"❌ [red]Error showing publication info: {e}[/red]")
-            raise
+        if publication:
+            console.print(f"✅ [green]Track published: [bold]{publication.name}[/bold] (SID: {publication.sid})[/green]")
+            console.print(f"🏠 [cyan]Room: {self.room.name or 'noise-canceller-room'}[/cyan]")
+            console.print()
+            logger.info(f"Track '{publication.name}' published with SID: {publication.sid}")
+        else:
+            raise RuntimeError("Track publication failed")
 
     async def _capture_filtered_audio_with_progress(self, filtered_stream, expected_chunks, progress, task_id):
         """Capture the noise-cancelled audio output with progress updates"""
         captured = 0
-        
-        # Wait for stream to be ready
         await asyncio.sleep(0.1)
         
         try:
@@ -350,8 +380,6 @@ class AudioFileProcessor:
                 frame = audio_event.frame
                 self.processed_frames.append(frame.data)
                 captured += 1
-                
-                # Update progress
                 progress.update(task_id, advance=1)
                 
                 if captured >= expected_chunks:
@@ -364,10 +392,8 @@ class AudioFileProcessor:
     def _load_audio_file(self, input_path: Path):
         """Load and preprocess audio file"""
         try:
-            # Load audio file using soundfile
             audio_data, sample_rate = sf.read(str(input_path), dtype='int16')
             
-            # Get channels info
             if audio_data.ndim == 1:
                 channels = 1
             else:
@@ -376,7 +402,6 @@ class AudioFileProcessor:
             duration_s = len(audio_data) / sample_rate
             
             if not self.silent:
-                # Create audio info table
                 audio_info = Table(title="🎵 Audio Properties", show_header=True, header_style="bold blue")
                 audio_info.add_column("Property", style="cyan")
                 audio_info.add_column("Value", style="green")
@@ -389,12 +414,8 @@ class AudioFileProcessor:
                 console.print(audio_info)
                 console.print()
             
-            # Convert to numpy array with proper shape
-            if channels == 1 and audio_data.ndim == 1:
-                audio_array = audio_data
-            else:
-                audio_array = audio_data
-            
+            audio_array = audio_data
+
             # Resample to 48kHz mono if needed
             if sample_rate != SAMPLERATE or channels != CHANNELS:
                 audio_array = self._resample_audio(audio_array, sample_rate, channels)
@@ -416,7 +437,6 @@ class AudioFileProcessor:
 
     def _resample_audio(self, audio_array, original_rate, original_channels):
         """High-quality resampling using LiveKit's AudioResampler"""
-        
         # Convert to mono if stereo
         if original_channels == 2:
             if audio_array.ndim == 2:
@@ -468,57 +488,6 @@ class AudioFileProcessor:
             for frame_data in self.processed_frames:
                 wav_file.writeframes(frame_data)
 
-    async def _connect_to_room(self):
-        """Connect to LiveKit Cloud room for authentication / metering"""
-        token = (
-            api.AccessToken()
-            .with_identity("noise-canceller")
-            .with_name("Noise Canceller")
-            .with_grants(
-                api.VideoGrants(
-                    room_join=True,
-                    room="noise-canceller-room",
-                    agent=True,
-                )
-            )
-            .to_jwt()
-        )
-        
-        url = os.getenv("LIVEKIT_URL")
-        if not url:
-            raise ValueError("LIVEKIT_URL environment variable is required")
-
-        room = rtc.Room()
-        
-        # Set up event handlers for track publication verification
-        @room.on("track_published")
-        def on_track_published(publication, participant):
-            if participant == room.local_participant:
-                logger.info(f"🎵 Local track published: {publication.name} (SID: {publication.sid})")
-                if not self.silent:
-                    console.print(f"🎵 [green]Track '{publication.name}' published to room[/green]")
-        
-        @room.on("track_unpublished")
-        def on_track_unpublished(publication, participant):
-            if participant == room.local_participant:
-                logger.info(f"🔇 Local track unpublished: {publication.name} (SID: {publication.sid})")
-                if not self.silent:
-                    console.print(f"🔇 [yellow]Track '{publication.name}' unpublished from room[/yellow]")
-        
-        @room.on("participant_connected")
-        def on_participant_connected(participant):
-            logger.debug(f"Participant connected: {participant.identity}")
-        
-        await room.connect(
-            url,
-            token,
-            options=rtc.RoomOptions(
-                auto_subscribe=False,
-            ),
-        )
-        logger.debug("Connected to LiveKit Cloud room for authentication / metering")
-        return room
-
 
 class FileAudioSource(rtc.AudioSource):
     """Custom audio source that streams from file data"""
@@ -559,8 +528,15 @@ def setup_logging(log_level: str, silent: bool = False):
             force=True
         )
 
+    # Suppress noisy agent framework / livekit SDK logs — our own logger
+    # ("noise-canceller") already captures everything the user needs to see.
+    for name in ("livekit", "livekit.agents", "livekit.plugins"):
+        logging.getLogger(name).setLevel(logging.ERROR)
 
-async def main():
+
+def main():
+    global console
+
     parser = argparse.ArgumentParser(
         description="🎵 Process audio files with LiveKit noise cancellation",
         epilog="""
@@ -611,11 +587,9 @@ async def main():
         help="Suppress all output (silent mode)"
     )
 
-    
     args = parser.parse_args()
     
     # Setup console for silent mode
-    global console
     if args.silent:
         console = NullConsole()
     
@@ -670,40 +644,53 @@ async def main():
         }
         noise_filter = filter_map[args.filter]
     
-    # Process the file
+    _config.update({
+        "input_file": str(input_path),
+        "output": str(output_path),
+        "filter": args.filter,
+        "noise_filter": noise_filter,
+        "use_webrtc": use_webrtc,
+        "silent": args.silent,
+    })
+
+    # Replicate the agents CLI "connect" command: create a real room via the
+    # API, then simulate_job(fake_job=False) so the entrypoint gets a genuine
+    # room connection with proper agent credentials.
+    room_name = f"noise-canceller-{os.getpid()}"
+
+    @server.once("worker_started")
+    def _on_started():
+        async def _run_job():
+            lk_api = api.LiveKitAPI()
+            try:
+                rooms = await lk_api.room.list_rooms(
+                    api.ListRoomsRequest(names=[room_name])
+                )
+                if rooms.rooms:
+                    room_info = rooms.rooms[0]
+                else:
+                    room_info = await lk_api.room.create_room(
+                        api.CreateRoomRequest(name=room_name)
+                    )
+            finally:
+                await lk_api.aclose()
+
+            await server.simulate_job(
+                room=room_name,
+                fake_job=False,
+                room_info=room_info,
+                agent_identity="noise-canceller",
+            )
+
+        asyncio.ensure_future(_run_job())
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
-        processor = AudioFileProcessor(noise_filter, use_webrtc=use_webrtc, silent=args.silent)
-        await processor.process_file(input_path, output_path)
-        
-        if not args.silent:
-            # Final success message
-            processing_type = "WebRTC" if use_webrtc else "LiveKit Enhanced"
-            final_panel = Panel.fit(
-                "🎉 [bold green]All Done![/bold green]\n"
-                f"[dim]Your {processing_type} noise-cancelled audio is ready at:[/dim]\n"
-                f"[cyan]{output_path}[/cyan]",
-                style="green"
-            )
-            console.print()
-            console.print(final_panel)
-        
-    except Exception as e:
-        if not args.silent:
-            error_panel = Panel.fit(
-                f"💥 [bold red]Processing Failed[/bold red]\n\n"
-                f"[dim]Error details:[/dim]\n"
-                f"[red]{str(e)}[/red]",
-                style="red"
-            )
-            console.print(error_panel)
-            
-            if args.log_level == "DEBUG":
-                console.print_exception()
-        else:
-            # In silent mode, still show critical errors to stderr
-            sys.stderr.write(f"ERROR: Processing failed - {str(e)}\n")
-        sys.exit(1)
+        loop.run_until_complete(server.run(devmode=True, unregistered=True))
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
