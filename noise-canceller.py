@@ -20,7 +20,9 @@ from rich.table import Table
 from livekit import rtc, api
 from livekit.agents import AgentServer, AutoSubscribe, JobContext
 from livekit.agents.job import JobExecutorType
-from livekit.plugins import noise_cancellation
+from livekit.agents.voice import AgentSession, Agent, room_io, io as voice_io
+from livekit.plugins import noise_cancellation, ai_coustics
+from livekit.plugins.ai_coustics import EnhancerModel
 from dotenv import load_dotenv
 
 SAMPLERATE = 48000
@@ -77,6 +79,27 @@ class NullProgress:
         pass
 
 
+class CapturingAudioInput(voice_io.AudioInput):
+    """Wraps an AudioInput to capture processed frames as they pass through.
+
+    The AgentSession's internal forward task still consumes frames normally,
+    but we record each one before handing it off.
+    """
+
+    def __init__(self, source: voice_io.AudioInput, expected_frames: int) -> None:
+        super().__init__(label="Capture", source=source)
+        self.frames: list[bytes] = []
+        self.expected_frames = expected_frames
+        self.done = asyncio.Event()
+
+    async def __anext__(self) -> rtc.AudioFrame:
+        frame = await super().__anext__()
+        self.frames.append(frame.data)
+        if len(self.frames) >= self.expected_frames:
+            self.done.set()
+        return frame
+
+
 _config: dict = {}
 
 server = AgentServer(job_executor_type=JobExecutorType.THREAD)
@@ -87,14 +110,16 @@ async def entrypoint(ctx: JobContext):
     """Agent entrypoint — processes the file then exits the process."""
     exit_code = 0
     try:
-        await ctx.connect(auto_subscribe=AutoSubscribe.SUBSCRIBE_NONE)
+        # SUBSCRIBE_ALL so the agent receives audio from the publisher connection
+        await ctx.connect(auto_subscribe=AutoSubscribe.SUBSCRIBE_ALL)
 
         processor = AudioFileProcessor(
+            room=ctx.room,
             noise_filter=_config["noise_filter"],
+            filter_key=_config["filter"],
             use_webrtc=_config["use_webrtc"],
             silent=_config["silent"],
         )
-        processor.room = ctx.room
         await processor.process_file(
             Path(_config["input_file"]),
             Path(_config["output"]),
@@ -102,7 +127,7 @@ async def entrypoint(ctx: JobContext):
 
         if not _config["silent"]:
             # Final success message
-            processing_type = "WebRTC" if _config["use_webrtc"] else "LiveKit Enhanced"
+            processing_type = _filter_display_name(_config["filter"])
             final_panel = Panel.fit(
                 "🎉 [bold green]All Done![/bold green]\n"
                 f"[dim]Your {processing_type} noise-cancelled audio is ready at:[/dim]\n"
@@ -129,21 +154,34 @@ async def entrypoint(ctx: JobContext):
         os._exit(exit_code)
 
 
+def _filter_display_name(filter_key: str) -> str:
+    """Human-readable name for a --filter value."""
+    return {
+        "NC": "Krisp Noise Cancellation",
+        "BVC": "Krisp Background Voice Cancellation",
+        "BVCTelephony": "Krisp BVC (Telephony)",
+        "WebRTC": "WebRTC Noise Suppression",
+        "aic-quail-l": "Ai-Coustics QUAIL-L",
+        "aic-quail-vfl": "Ai-Coustics QUAIL-VF-L",
+    }.get(filter_key, filter_key)
+
+
 class AudioFileProcessor:
-    def __init__(self, noise_filter, use_webrtc=False, silent=False):
+    def __init__(self, room: rtc.Room, noise_filter, filter_key: str, use_webrtc=False, silent=False):
+        self.room = room
         self.noise_filter = noise_filter
+        self.filter_key = filter_key
         self.use_webrtc = use_webrtc
-        self.processed_frames = []
-        self.room: rtc.Room | None = None
+        self.processed_frames: list[bytes] = []
         self.silent = silent
 
     async def process_file(self, input_path: Path, output_path: Path):
         """Process an audio file with LiveKit noise cancellation or WebRTC noise suppression"""
         if not self.silent:
             # Create beautiful header panel
-            processing_type = "WebRTC Noise Suppression" if self.use_webrtc else "LiveKit Enhanced Noise Cancellation"
+            display_name = _filter_display_name(self.filter_key)
             header = Panel.fit(
-                f"🎵 [bold cyan]Audio {processing_type}[/bold cyan] 🎵\n"
+                f"🎵 [bold cyan]Audio {display_name}[/bold cyan] 🎵\n"
                 f"[dim]Powered by LiveKit Cloud[/dim]",
                 style="cyan"
             )
@@ -161,8 +199,7 @@ class AudioFileProcessor:
                 file_info.add_row("Processing Type", "WebRTC AudioProcessingModule")
                 file_info.add_row("Features", "Noise Suppression + Echo Cancellation + High-pass Filter")
             else:
-                file_info.add_row("Processing Type", "LiveKit Enhanced")
-                file_info.add_row("Filter Type", self.noise_filter.__class__.__name__)
+                file_info.add_row("Processing Type", display_name)
             
             console.print(file_info)
             console.print()
@@ -249,85 +286,146 @@ class AudioFileProcessor:
             logger.info(f"Successfully processed {len(self.processed_frames)} frames with WebRTC APM")
 
     async def _process_with_noise_cancellation(self, audio_data):
-        """Process audio data through LiveKit enhanced noise cancellation with progress tracking"""
+        """Process audio data through the LiveKit Agents pipeline with noise cancellation.
+
+        Uses a two-connection architecture so that the agents SDK's RoomIO
+        handles credential passing to FrameProcessor-based filters (e.g.
+        Ai-Coustics) automatically — no private method calls required.
+
+        Publisher connection  --[audio]--> LiveKit SFU --[subscribe]--> Agent RoomIO
+                                                                          |
+                                                           noise cancellation applied
+                                                                          |
+                                                                  CapturingAudioInput
+        """
         chunk_count = len(audio_data) // SAMPLES_PER_CHUNK
         if len(audio_data) % SAMPLES_PER_CHUNK != 0:
             chunk_count += 1
-        
-        # Step 1: Publish the raw audio as a microphone track
-        with console.status("[bold yellow]Publishing audio track to LiveKit room...", spinner="dots"):
-            logger.debug("Publishing raw audio track...")
-            file_source = FileAudioSource(audio_data, SAMPLERATE, CHANNELS)
-            input_track = rtc.LocalAudioTrack.create_audio_track("raw-input", file_source)
-            
-            input_options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
-            publication = await self.room.local_participant.publish_track(input_track, input_options)
-            
-            # Wait for track to be ready and subscribed
-            await asyncio.sleep(0.5)
-        
-        # Show simple track publication info
-        if not self.silent:
-            await self._show_publication_info(publication)
-        
-        # Step 2: Create a stream that receives from the participant with noise cancellation
-        logger.debug("Setting up noise-cancelled audio stream...")
-        
-        filtered_stream = None
+
+        publisher_room: rtc.Room | None = None
+        session: AgentSession | None = None
+
         try:
-            # This is the key - create stream from participant with noise cancellation
-            filtered_stream = rtc.AudioStream.from_participant(
-                participant=self.room.local_participant,
-                track_source=rtc.TrackSource.SOURCE_MICROPHONE,
-                noise_cancellation=self.noise_filter
+            # Step 1: Create a second "publisher" room connection that will
+            # appear as a remote participant to the agent's room.
+            with console.status("[bold yellow]Connecting publisher to LiveKit room...", spinner="dots"):
+                publisher_token = (
+                    api.AccessToken(
+                        os.environ["LIVEKIT_API_KEY"],
+                        os.environ["LIVEKIT_API_SECRET"],
+                    )
+                    .with_identity("file-publisher")
+                    .with_grants(api.VideoGrants(room_join=True, room=self.room.name))
+                    .to_jwt()
+                )
+                publisher_room = rtc.Room()
+                await publisher_room.connect(os.environ["LIVEKIT_URL"], publisher_token)
+                logger.debug("Publisher connected to room %s", self.room.name)
+
+            # Step 2: Publish the raw audio track from the publisher connection.
+            with console.status("[bold yellow]Publishing audio track...", spinner="dots"):
+                file_source = FileAudioSource(audio_data, SAMPLERATE, CHANNELS)
+                input_track = rtc.LocalAudioTrack.create_audio_track("raw-input", file_source)
+                pub_options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
+                publication = await publisher_room.local_participant.publish_track(
+                    input_track, pub_options,
+                )
+                await asyncio.sleep(0.5)
+
+            if not self.silent:
+                if publication:
+                    console.print(
+                        f"✅ [green]Track published: [bold]{publication.name}[/bold]"
+                        f" (SID: {publication.sid})[/green]"
+                    )
+                    console.print(f"🏠 [cyan]Room: {self.room.name}[/cyan]")
+                    console.print()
+
+            # Step 3: Start an AgentSession whose RoomIO receives the
+            # publisher's audio through the noise-cancellation pipeline.
+            session = AgentSession()
+            await session.start(
+                agent=Agent(instructions=""),
+                room=self.room,
+                room_options=room_io.RoomOptions(
+                    audio_input=room_io.AudioInputOptions(
+                        noise_cancellation=self.noise_filter,
+                        sample_rate=SAMPLERATE,
+                        num_channels=CHANNELS,
+                        frame_size_ms=CHUNK_DURATION_MS,
+                    ),
+                    audio_output=False,
+                    text_input=False,
+                    text_output=False,
+                    close_on_disconnect=False,
+                ),
             )
-            
-            # Step 3: Feed audio data and capture processed output with progress bars
+
+            # Step 4: Wrap the RoomIO audio input with our capturing wrapper.
+            # _forward_audio_task was just created via asyncio.create_task and
+            # hasn't executed yet — safe to swap before yielding.
+            raw_audio_input = session.input.audio
+            if raw_audio_input is None:
+                raise RuntimeError("AgentSession did not create an audio input")
+            capturing = CapturingAudioInput(raw_audio_input, expected_frames=chunk_count)
+            session.input.audio = capturing
+
+            # Step 5: Feed audio data from the publisher and wait for capture.
             progress_class = NullProgress if self.silent else Progress
-            
             with progress_class(
                 SpinnerColumn(),
                 TextColumn("[progress.description]{task.description}"),
                 BarColumn(),
                 TaskProgressColumn(),
                 TimeElapsedColumn(),
-                console=console
+                console=console,
             ) as progress:
-                
-                # Create progress tasks
                 feed_task = progress.add_task("🎤 Feeding audio chunks", total=chunk_count)
                 capture_task = progress.add_task("🔊 Capturing processed audio", total=chunk_count)
-                
-                # Start feeding and capturing concurrently
-                feed_coro = self._feed_audio_data_with_progress(file_source, audio_data, chunk_count, progress, feed_task)
-                capture_coro = self._capture_filtered_audio_with_progress(filtered_stream, chunk_count, progress, capture_task)
-                
-                # Wait for both tasks with timeout
+
+                async def _feed():
+                    await self._feed_audio_data_with_progress(
+                        file_source, audio_data, chunk_count, progress, feed_task,
+                    )
+
+                async def _wait_capture():
+                    last_count = 0
+                    while not capturing.done.is_set():
+                        await asyncio.sleep(0.05)
+                        new_count = len(capturing.frames)
+                        if new_count > last_count:
+                            progress.update(capture_task, advance=new_count - last_count)
+                            last_count = new_count
+                    # Final update
+                    if last_count < len(capturing.frames):
+                        progress.update(capture_task, advance=len(capturing.frames) - last_count)
+
                 try:
-                    await asyncio.wait_for(asyncio.gather(feed_coro, capture_coro), timeout=120.0)
-                    logger.info(f"Successfully processed {len(self.processed_frames)} frames")
-                    
+                    await asyncio.wait_for(
+                        asyncio.gather(_feed(), _wait_capture()), timeout=120.0,
+                    )
                 except asyncio.TimeoutError:
                     if not self.silent:
                         console.print("⚠️  [yellow]Processing timed out[/yellow]")
-                    
+
+            self.processed_frames = capturing.frames
+            logger.info("Successfully processed %d frames", len(self.processed_frames))
+
         except Exception as e:
             if not self.silent:
-                console.print(f"❌ [red]Error setting up noise cancellation: {e}[/red]")
+                console.print(f"❌ [red]Error during noise cancellation: {e}[/red]")
             raise
         finally:
-            # Clean up resources
-            if filtered_stream:
+            if session:
                 try:
-                    await filtered_stream.aclose()
+                    await session.aclose()
                 except Exception as e:
-                    logger.debug(f"Audio stream cleanup completed: {e}")
-            
-            # Unpublish the track
-            try:
-                await self.room.local_participant.unpublish_track(publication.sid)
-            except Exception as e:
-                logger.debug(f"Track unpublish completed: {e}")
+                    logger.debug("AgentSession cleanup: %s", e)
+            if publisher_room:
+                try:
+                    await publisher_room.disconnect()
+                except Exception as e:
+                    logger.debug("Publisher disconnect: %s", e)
 
     async def _feed_audio_data_with_progress(self, file_source, audio_data, chunk_count, progress, task_id):
         """Feed audio data to the source with precise timing and progress updates"""
@@ -359,35 +457,6 @@ class AudioFileProcessor:
             
             if delay > 0:
                 await asyncio.sleep(delay)
-
-    async def _show_publication_info(self, publication):
-        """Show simple track publication info"""
-        if publication:
-            console.print(f"✅ [green]Track published: [bold]{publication.name}[/bold] (SID: {publication.sid})[/green]")
-            console.print(f"🏠 [cyan]Room: {self.room.name or 'noise-canceller-room'}[/cyan]")
-            console.print()
-            logger.info(f"Track '{publication.name}' published with SID: {publication.sid}")
-        else:
-            raise RuntimeError("Track publication failed")
-
-    async def _capture_filtered_audio_with_progress(self, filtered_stream, expected_chunks, progress, task_id):
-        """Capture the noise-cancelled audio output with progress updates"""
-        captured = 0
-        await asyncio.sleep(0.1)
-        
-        try:
-            async for audio_event in filtered_stream:
-                frame = audio_event.frame
-                self.processed_frames.append(frame.data)
-                captured += 1
-                progress.update(task_id, advance=1)
-                
-                if captured >= expected_chunks:
-                    break
-                    
-        except Exception as e:
-            if not self.silent:
-                console.print(f"❌ [red]Error capturing processed audio: {e}[/red]")
 
     def _load_audio_file(self, input_path: Path):
         """Load and preprocess audio file"""
@@ -517,7 +586,7 @@ def setup_logging(log_level: str, silent: bool = False):
             show_level=True,
             show_path=False,
             rich_tracebacks=True,
-            tracebacks_suppress=[rtc, api, noise_cancellation]
+            tracebacks_suppress=[rtc, api, noise_cancellation, ai_coustics]
         )
         
         # Configure logging
@@ -530,8 +599,16 @@ def setup_logging(log_level: str, silent: bool = False):
 
     # Suppress noisy agent framework / livekit SDK logs — our own logger
     # ("noise-canceller") already captures everything the user needs to see.
-    for name in ("livekit", "livekit.agents", "livekit.plugins"):
+    for name in ("livekit", "livekit.agents", "livekit.plugins", "livekit.rtc"):
         logging.getLogger(name).setLevel(logging.ERROR)
+
+    # The livekit-rtc Room uses logging.info() on the root logger for
+    # "ignoring text stream" messages — filter those out.
+    class _IgnoreTextStreamFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            return "ignoring text stream" not in record.getMessage()
+
+    logging.getLogger().addFilter(_IgnoreTextStreamFilter())
 
 
 def main():
@@ -545,6 +622,8 @@ def main():
   uv run noise-canceller.py input.wav -o clean_audio.wav
   uv run noise-canceller.py song.flac --filter BVC
   uv run noise-canceller.py audio.m4a --filter WebRTC
+  uv run noise-canceller.py audio.m4a --filter aic-quail-l
+  uv run noise-canceller.py audio.m4a --filter aic-quail-vfl
   uv run noise-canceller.py audio.m4a -o processed.wav --silent
   
 📁 Supported formats: MP3, WAV, FLAC, OGG, M4A, AAC, AIFF, and more
@@ -571,9 +650,9 @@ def main():
     )
     parser.add_argument(
         "--filter",
-        choices=["NC", "BVC", "BVCTelephony", "WebRTC"],
+        choices=["NC", "BVC", "BVCTelephony", "WebRTC", "aic-quail-l", "aic-quail-vfl"],
         default="NC",
-        help="Noise cancellation filter type (default: NC). WebRTC uses built-in WebRTC noise suppression."
+        help="Noise cancellation filter type (default: NC). WebRTC uses built-in WebRTC noise suppression. aic-quail-l and aic-quail-vfl use Ai-coustics enhancement models."
     )
     parser.add_argument(
         "--log-level",
@@ -640,7 +719,9 @@ def main():
         filter_map = {
             "BVC": noise_cancellation.BVC(),
             "BVCTelephony": noise_cancellation.BVCTelephony(),
-            "NC": noise_cancellation.NC()
+            "NC": noise_cancellation.NC(),
+            "aic-quail-l": ai_coustics.audio_enhancement(model=EnhancerModel.QUAIL_L),
+            "aic-quail-vfl": ai_coustics.audio_enhancement(model=EnhancerModel.QUAIL_VF_L),
         }
         noise_filter = filter_map[args.filter]
     

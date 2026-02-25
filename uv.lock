@@ -708,6 +708,21 @@ wheels = [
 ]
 
 [[package]]
+name = "livekit-plugins-ai-coustics"
+version = "0.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "livekit" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/81/9a/18e9982ae499db43d0b8e8307a6de7f4e5af1d2c057684dadc851c880c08/livekit_plugins_ai_coustics-0.2.0.tar.gz", hash = "sha256:1430b488d6a664117e389af61a488ba53ab5dddafb685c49eb2dd098898c103f", size = 14494, upload-time = "2026-02-24T18:23:27.502Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/dd/30/5c42f1b4e12e287e36aeeac12a44a9873b17997808220ac74b65e70e7965/livekit_plugins_ai_coustics-0.2.0-cp39-abi3-macosx_10_9_x86_64.whl", hash = "sha256:81d2f1608d6c9c8f64cd73ab9effdc8eb5726d49d0e27f0f7ed7e47ae51fdf94", size = 81223202, upload-time = "2026-02-24T18:23:10.699Z" },
+    { url = "https://files.pythonhosted.org/packages/e2/03/0c570e8b0979edf0c8909ef01c6337ad8dc9ab3cfa4a138c2f8a25967fe0/livekit_plugins_ai_coustics-0.2.0-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:a50b976dd25312a835987a349cba91361e450fb4361daea137b3e0e58ae95f2d", size = 81433204, upload-time = "2026-02-24T18:23:16.04Z" },
+    { url = "https://files.pythonhosted.org/packages/08/e8/fd5d25720e57dc27769d5e04916c822503dce627d2addf8d07f5b934979f/livekit_plugins_ai_coustics-0.2.0-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:94bd0c0537eb6c66eeab4b51e2d18f82c340496bfbee5d36c45d06b13d34205c", size = 80799494, upload-time = "2026-02-24T18:23:20.294Z" },
+    { url = "https://files.pythonhosted.org/packages/0c/51/ed09c6b8c0ddd2ff88585acb4fb7571699daddf6367029da3a3073587062/livekit_plugins_ai_coustics-0.2.0-cp39-abi3-win_amd64.whl", hash = "sha256:867da3c1e09db2dbf8c4f0d8aa60c6c776d470ce579da9522f8fb9c9761d06a0", size = 80278473, upload-time = "2026-02-24T18:23:24.919Z" },
+]
+
+[[package]]
 name = "livekit-plugins-noise-cancellation"
 version = "0.2.5"
 source = { registry = "https://pypi.org/simple" }
@@ -852,6 +867,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "livekit-agents" },
+    { name = "livekit-plugins-ai-coustics" },
     { name = "livekit-plugins-noise-cancellation" },
     { name = "python-dotenv" },
     { name = "rich" },
@@ -861,6 +877,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "livekit-agents", specifier = "~=1.4" },
+    { name = "livekit-plugins-ai-coustics", specifier = "~=0.2" },
     { name = "livekit-plugins-noise-cancellation", specifier = "~=0.2" },
     { name = "python-dotenv", specifier = "~=1.1" },
     { name = "rich", specifier = ">=14.0.0" },
