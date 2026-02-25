@@ -110,32 +110,39 @@ async def entrypoint(ctx: JobContext):
     """Agent entrypoint — processes the file then exits the process."""
     exit_code = 0
     try:
-        # SUBSCRIBE_ALL so the agent receives audio from the publisher connection
         await ctx.connect(auto_subscribe=AutoSubscribe.SUBSCRIBE_ALL)
 
-        processor = AudioFileProcessor(
-            room=ctx.room,
-            noise_filter=_config["noise_filter"],
-            filter_key=_config["filter"],
-            use_webrtc=_config["use_webrtc"],
-            silent=_config["silent"],
-        )
-        await processor.process_file(
-            Path(_config["input_file"]),
-            Path(_config["output"]),
-        )
+        filters = _config["filters"]
+        silent = _config["silent"]
+        input_file = Path(_config["input_file"])
+        outputs: list[tuple[str, str]] = []  # (display_name, output_path)
 
-        if not _config["silent"]:
-            # Final success message
-            processing_type = _filter_display_name(_config["filter"])
-            final_panel = Panel.fit(
-                "🎉 [bold green]All Done![/bold green]\n"
-                f"[dim]Your {processing_type} noise-cancelled audio is ready at:[/dim]\n"
-                f"[cyan]{_config['output']}[/cyan]",
-                style="green"
+        for fc in filters:
+            processor = AudioFileProcessor(
+                room=ctx.room,
+                noise_filter=fc["noise_filter"],
+                filter_key=fc["filter"],
+                use_webrtc=fc["use_webrtc"],
+                silent=silent,
             )
+            await processor.process_file(input_file, Path(fc["output"]))
+            outputs.append((_filter_display_name(fc["filter"]), fc["output"]))
+
+        if not silent:
+            if len(outputs) == 1:
+                name, path = outputs[0]
+                body = (
+                    "🎉 [bold green]All Done![/bold green]\n"
+                    f"[dim]Your {name} noise-cancelled audio is ready at:[/dim]\n"
+                    f"[cyan]{path}[/cyan]"
+                )
+            else:
+                lines = ["🎉 [bold green]All Done![/bold green]"]
+                for name, path in outputs:
+                    lines.append(f"  [dim]{name}:[/dim] [cyan]{path}[/cyan]")
+                body = "\n".join(lines)
             console.print()
-            console.print(final_panel)
+            console.print(Panel.fit(body, style="green"))
 
     except Exception as e:
         exit_code = 1
@@ -624,6 +631,7 @@ def main():
   uv run noise-canceller.py audio.m4a --filter WebRTC
   uv run noise-canceller.py audio.m4a --filter aic-quail-l
   uv run noise-canceller.py audio.m4a --filter aic-quail-vfl
+  uv run noise-canceller.py audio.m4a --filter all
   uv run noise-canceller.py audio.m4a -o processed.wav --silent
   
 📁 Supported formats: MP3, WAV, FLAC, OGG, M4A, AAC, AIFF, and more
@@ -650,9 +658,9 @@ def main():
     )
     parser.add_argument(
         "--filter",
-        choices=["NC", "BVC", "BVCTelephony", "WebRTC", "aic-quail-l", "aic-quail-vfl"],
+        choices=["NC", "BVC", "BVCTelephony", "WebRTC", "aic-quail-l", "aic-quail-vfl", "all"],
         default="NC",
-        help="Noise cancellation filter type (default: NC). WebRTC uses built-in WebRTC noise suppression. aic-quail-l and aic-quail-vfl use Ai-coustics enhancement models."
+        help="Noise cancellation filter type (default: NC). 'all' runs every filter and saves separate output files."
     )
     parser.add_argument(
         "--log-level",
@@ -700,37 +708,36 @@ def main():
             sys.stderr.write(f"ERROR: Input file '{input_path}' does not exist\n")
         sys.exit(1)
     
-    # Set output path
-    if args.output:
-        output_path = Path(args.output)
-    else:
-        filter_suffix = args.filter.lower()
-        output_path = Path(f"output/{input_path.stem}-{filter_suffix}-processed.wav")
-    
-    # Ensure output directory exists
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    # Choose noise cancellation filter
-    use_webrtc = args.filter == "WebRTC"
-    if use_webrtc:
-        # For WebRTC, we don't need a LiveKit noise filter
-        noise_filter = None
-    else:
-        filter_map = {
-            "BVC": noise_cancellation.BVC(),
-            "BVCTelephony": noise_cancellation.BVCTelephony(),
-            "NC": noise_cancellation.NC(),
-            "aic-quail-l": ai_coustics.audio_enhancement(model=EnhancerModel.QUAIL_L),
-            "aic-quail-vfl": ai_coustics.audio_enhancement(model=EnhancerModel.QUAIL_VF_L),
-        }
-        noise_filter = filter_map[args.filter]
-    
+    # Build filter config(s)
+    filter_map = {
+        "NC": lambda: noise_cancellation.NC(),
+        "BVC": lambda: noise_cancellation.BVC(),
+        "BVCTelephony": lambda: noise_cancellation.BVCTelephony(),
+        "aic-quail-l": lambda: ai_coustics.audio_enhancement(model=EnhancerModel.QUAIL_L),
+        "aic-quail-vfl": lambda: ai_coustics.audio_enhancement(model=EnhancerModel.QUAIL_VF_L),
+    }
+    ALL_FILTERS = ["NC", "BVC", "BVCTelephony", "WebRTC", "aic-quail-l", "aic-quail-vfl"]
+    selected = ALL_FILTERS if args.filter == "all" else [args.filter]
+
+    filter_configs: list[dict] = []
+    for fk in selected:
+        use_webrtc = fk == "WebRTC"
+        nf = None if use_webrtc else filter_map[fk]()
+        if args.output and len(selected) == 1:
+            out = Path(args.output)
+        else:
+            out = Path(f"output/{input_path.stem}-{fk.lower()}-processed.wav")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        filter_configs.append({
+            "filter": fk,
+            "noise_filter": nf,
+            "use_webrtc": use_webrtc,
+            "output": str(out),
+        })
+
     _config.update({
         "input_file": str(input_path),
-        "output": str(output_path),
-        "filter": args.filter,
-        "noise_filter": noise_filter,
-        "use_webrtc": use_webrtc,
+        "filters": filter_configs,
         "silent": args.silent,
     })
 
