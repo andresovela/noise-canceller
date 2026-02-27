@@ -15,7 +15,14 @@ import soundfile as sf
 # Rich imports for beautiful CLI
 from rich.console import Console
 from rich.logging import RichHandler
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
+from rich.progress import (
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    BarColumn,
+    TaskProgressColumn,
+    TimeElapsedColumn,
+)
 from rich.panel import Panel
 from rich.table import Table
 
@@ -44,40 +51,43 @@ logger = logging.getLogger("noise-canceller")
 
 class NullConsole:
     """A console that suppresses all output for silent mode"""
+
     def print(self, *args, **kwargs):
         pass
-    
+
     def status(self, *args, **kwargs):
         return NullContext()
-    
+
     def print_exception(self, *args, **kwargs):
         pass
 
 
 class NullContext:
     """A context manager that does nothing"""
+
     def __enter__(self):
         return self
-    
+
     def __exit__(self, *args):
         pass
 
 
 class NullProgress:
     """A progress tracker that does nothing for silent mode"""
+
     def __init__(self, *args, **kwargs):
         # Accept any arguments but ignore them
         pass
-    
+
     def __enter__(self):
         return self
-    
+
     def __exit__(self, *args):
         pass
-    
+
     def add_task(self, *args, **kwargs):
         return 0
-    
+
     def update(self, *args, **kwargs):
         pass
 
@@ -89,8 +99,12 @@ class CapturingAudioInput(voice_io.AudioInput):
     but we record each one before handing it off.
     """
 
-    def __init__(self, source: voice_io.AudioInput, expected_frames: int,
-                 processed_stt: "SttStream | None" = None) -> None:
+    def __init__(
+        self,
+        source: voice_io.AudioInput,
+        expected_frames: int,
+        processed_stt: "SttStream | None" = None,
+    ) -> None:
         super().__init__(label="Capture", source=source)
         self.frames: list[bytes] = []
         self.expected_frames = expected_frames
@@ -181,27 +195,32 @@ async def entrypoint(ctx: JobContext):
 
                 bar_ids: dict[str, int] = {}
                 bar_ids["feed"] = progress.add_task(
-                    "  📦 Chunking original audio", total=0,
+                    "  📦 Chunking original audio",
+                    total=0,
                 )
                 if ground_truth_file and i == 0:
                     orig_stream = SttStream(stt_model, "orig")
                     original_stt_stream = orig_stream
                     bar_ids["orig_stt"] = progress.add_task(
-                        f"  📡 Sending to {stt_model}", total=0,
+                        f"  📡 Sending to {stt_model}",
+                        total=0,
                     )
                 bar_ids["nc"] = progress.add_task(
-                    f"  🎤 Sending to {short_name}", total=0,
+                    f"  🎤 Sending to {short_name}",
+                    total=0,
                 )
                 if ground_truth_file:
                     filter_name = _filter_display_name(fc["filter"])
                     proc_stream = SttStream(stt_model, filter_name)
                     processed_stt_streams.append((fc, proc_stream))
                     bar_ids["proc_stt"] = progress.add_task(
-                        f"  📡 Sending {short_name} output to {stt_model}", total=0,
+                        f"  📡 Sending {short_name} output to {stt_model}",
+                        total=0,
                     )
 
                 await processor.process_file(
-                    input_file, Path(fc["output"]),
+                    input_file,
+                    Path(fc["output"]),
                     progress=progress,
                     bar_ids=bar_ids,
                     original_stt=orig_stream,
@@ -213,8 +232,9 @@ async def entrypoint(ctx: JobContext):
         # Wait for STT collection to finish (transcripts still arriving
         # after all chunks have been sent).
         if ground_truth_file:
-            with console.status("[bold green]Waiting for transcription results…",
-                                spinner="dots"):
+            with console.status(
+                "[bold green]Waiting for transcription results…", spinner="dots"
+            ):
                 if original_stt_stream is not None:
                     await original_stt_stream.result()
                 for _fc, ps in processed_stt_streams:
@@ -274,7 +294,7 @@ async def entrypoint(ctx: JobContext):
                 f"💥 [bold red]Processing Failed[/bold red]\n\n"
                 f"[dim]Error details:[/dim]\n"
                 f"[red]{e}[/red]",
-                style="red"
+                style="red",
             )
             console.print(error_panel)
         else:
@@ -309,7 +329,14 @@ def _filter_short_name(filter_key: str) -> str:
 
 
 class AudioFileProcessor:
-    def __init__(self, room: rtc.Room, noise_filter, filter_key: str, use_webrtc=False, silent=False):
+    def __init__(
+        self,
+        room: rtc.Room,
+        noise_filter,
+        filter_key: str,
+        use_webrtc=False,
+        silent=False,
+    ):
         self.room = room
         self.noise_filter = noise_filter
         self.filter_key = filter_key
@@ -318,10 +345,15 @@ class AudioFileProcessor:
         self.original_audio: np.ndarray | None = None
         self.silent = silent
 
-    async def process_file(self, input_path: Path, output_path: Path, progress=None,
-                           bar_ids: dict[str, int] | None = None,
-                           original_stt: "SttStream | None" = None,
-                           processed_stt: "SttStream | None" = None):
+    async def process_file(
+        self,
+        input_path: Path,
+        output_path: Path,
+        progress=None,
+        bar_ids: dict[str, int] | None = None,
+        original_stt: "SttStream | None" = None,
+        processed_stt: "SttStream | None" = None,
+    ):
         """Process an audio file with LiveKit noise cancellation or WebRTC noise suppression.
 
         When *progress* is an active Rich Progress instance the method adds its
@@ -342,12 +374,16 @@ class AudioFileProcessor:
             header = Panel.fit(
                 f"🎵 [bold cyan]{display_name}[/bold cyan] 🎵\n"
                 f"[dim]Powered by LiveKit Cloud[/dim]",
-                style="cyan"
+                style="cyan",
             )
             console.print(header)
             console.print()
 
-            file_info = Table(title="📁 File Information", show_header=True, header_style="bold magenta")
+            file_info = Table(
+                title="📁 File Information",
+                show_header=True,
+                header_style="bold magenta",
+            )
             file_info.add_column("Property", style="cyan")
             file_info.add_column("Value", style="green")
 
@@ -355,7 +391,10 @@ class AudioFileProcessor:
             file_info.add_row("Output File", str(output_path))
             if self.use_webrtc:
                 file_info.add_row("Processing Type", "WebRTC AudioProcessingModule")
-                file_info.add_row("Features", "Noise Suppression + Echo Cancellation + High-pass Filter")
+                file_info.add_row(
+                    "Features",
+                    "Noise Suppression + Echo Cancellation + High-pass Filter",
+                )
             else:
                 file_info.add_row("Processing Type", display_name)
 
@@ -370,33 +409,47 @@ class AudioFileProcessor:
         self.original_audio = audio_data
 
         if self.use_webrtc:
-            await self._process_with_webrtc_apm(audio_data, progress=progress,
-                                                bar_ids=bar_ids,
-                                                original_stt=original_stt,
-                                                processed_stt=processed_stt)
+            await self._process_with_webrtc_apm(
+                audio_data,
+                progress=progress,
+                bar_ids=bar_ids,
+                original_stt=original_stt,
+                processed_stt=processed_stt,
+            )
         else:
-            await self._process_with_noise_cancellation(audio_data, progress=progress,
-                                                        bar_ids=bar_ids,
-                                                        original_stt=original_stt,
-                                                        processed_stt=processed_stt)
+            await self._process_with_noise_cancellation(
+                audio_data,
+                progress=progress,
+                bar_ids=bar_ids,
+                original_stt=original_stt,
+                processed_stt=processed_stt,
+            )
 
         if progress is not None:
             self._save_output(output_path)
         else:
-            with console.status("[bold green]Saving processed audio...", spinner="dots"):
+            with console.status(
+                "[bold green]Saving processed audio...", spinner="dots"
+            ):
                 self._save_output(output_path)
 
-    async def _process_with_webrtc_apm(self, audio_data, progress=None,
-                                       bar_ids: dict[str, int] | None = None,
-                                       original_stt: "SttStream | None" = None,
-                                       processed_stt: "SttStream | None" = None):
+    async def _process_with_webrtc_apm(
+        self,
+        audio_data,
+        progress=None,
+        bar_ids: dict[str, int] | None = None,
+        original_stt: "SttStream | None" = None,
+        processed_stt: "SttStream | None" = None,
+    ):
         """Process audio data using WebRTC AudioProcessingModule"""
         chunk_count = len(audio_data) // SAMPLES_PER_CHUNK
         if len(audio_data) % SAMPLES_PER_CHUNK != 0:
             chunk_count += 1
 
         if not self.silent:
-            console.print("🔧 [yellow]Initializing WebRTC AudioProcessingModule...[/yellow]")
+            console.print(
+                "🔧 [yellow]Initializing WebRTC AudioProcessingModule...[/yellow]"
+            )
 
         apm = rtc.AudioProcessingModule(
             noise_suppression=True,
@@ -422,7 +475,9 @@ class AudioFileProcessor:
 
         with ctx as prog:
             if not ids:
-                ids["nc"] = prog.add_task("  🎙️ Processing with WebRTC APM", total=chunk_count)
+                ids["nc"] = prog.add_task(
+                    "  🎙️ Processing with WebRTC APM", total=chunk_count
+                )
             else:
                 for tid in ids.values():
                     prog.update(tid, total=chunk_count)
@@ -433,7 +488,12 @@ class AudioFileProcessor:
                 chunk = audio_data[start_idx:end_idx]
 
                 if len(chunk) < SAMPLES_PER_CHUNK:
-                    chunk = np.concatenate([chunk, np.zeros(SAMPLES_PER_CHUNK - len(chunk), dtype=np.int16)])
+                    chunk = np.concatenate(
+                        [
+                            chunk,
+                            np.zeros(SAMPLES_PER_CHUNK - len(chunk), dtype=np.int16),
+                        ]
+                    )
 
                 audio_frame = rtc.AudioFrame(
                     data=chunk.tobytes(),
@@ -466,12 +526,18 @@ class AudioFileProcessor:
             if processed_stt is not None:
                 processed_stt.end_input()
 
-            logger.info(f"Successfully processed {len(self.processed_frames)} frames with WebRTC APM")
+            logger.info(
+                f"Successfully processed {len(self.processed_frames)} frames with WebRTC APM"
+            )
 
-    async def _process_with_noise_cancellation(self, audio_data, progress=None,
-                                                bar_ids: dict[str, int] | None = None,
-                                                original_stt: "SttStream | None" = None,
-                                                processed_stt: "SttStream | None" = None):
+    async def _process_with_noise_cancellation(
+        self,
+        audio_data,
+        progress=None,
+        bar_ids: dict[str, int] | None = None,
+        original_stt: "SttStream | None" = None,
+        processed_stt: "SttStream | None" = None,
+    ):
         """Process audio data through the LiveKit Agents pipeline with noise cancellation.
 
         Uses a two-connection architecture so that the agents SDK's RoomIO
@@ -507,10 +573,15 @@ class AudioFileProcessor:
             logger.debug("Publisher connected to room %s", self.room.name)
 
             file_source = FileAudioSource(audio_data, SAMPLERATE, CHANNELS)
-            input_track = rtc.LocalAudioTrack.create_audio_track("raw-input", file_source)
-            pub_options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
+            input_track = rtc.LocalAudioTrack.create_audio_track(
+                "raw-input", file_source
+            )
+            pub_options = rtc.TrackPublishOptions(
+                source=rtc.TrackSource.SOURCE_MICROPHONE
+            )
             publication = await publisher_room.local_participant.publish_track(
-                input_track, pub_options,
+                input_track,
+                pub_options,
             )
             await asyncio.sleep(0.5)
 
@@ -544,8 +615,11 @@ class AudioFileProcessor:
             raw_audio_input = session.input.audio
             if raw_audio_input is None:
                 raise RuntimeError("AgentSession did not create an audio input")
-            capturing = CapturingAudioInput(raw_audio_input, expected_frames=chunk_count,
-                                              processed_stt=processed_stt)
+            capturing = CapturingAudioInput(
+                raw_audio_input,
+                expected_frames=chunk_count,
+                processed_stt=processed_stt,
+            )
             session.input.audio = capturing
 
             if progress is None:
@@ -571,12 +645,22 @@ class AudioFileProcessor:
                     for tid in ids.values():
                         prog.update(tid, total=chunk_count)
                 else:
-                    feed_ids = [prog.add_task("  🎤 Feeding audio chunks", total=chunk_count)]
-                    capture_ids = [prog.add_task("  🔊 Capturing processed audio", total=chunk_count)]
+                    feed_ids = [
+                        prog.add_task("  🎤 Feeding audio chunks", total=chunk_count)
+                    ]
+                    capture_ids = [
+                        prog.add_task(
+                            "  🔊 Capturing processed audio", total=chunk_count
+                        )
+                    ]
 
                 async def _feed():
                     await self._feed_audio_data_with_progress(
-                        file_source, audio_data, chunk_count, prog, feed_ids,
+                        file_source,
+                        audio_data,
+                        chunk_count,
+                        prog,
+                        feed_ids,
                         original_stt=original_stt,
                     )
 
@@ -597,7 +681,8 @@ class AudioFileProcessor:
 
                 try:
                     await asyncio.wait_for(
-                        asyncio.gather(_feed(), _wait_capture()), timeout=120.0,
+                        asyncio.gather(_feed(), _wait_capture()),
+                        timeout=120.0,
                     )
                 except asyncio.TimeoutError:
                     if not self.silent:
@@ -622,9 +707,15 @@ class AudioFileProcessor:
                 except Exception as e:
                     logger.debug("Publisher disconnect: %s", e)
 
-    async def _feed_audio_data_with_progress(self, file_source, audio_data, chunk_count,
-                                              progress, task_ids: list[int] | int,
-                                              original_stt: "SttStream | None" = None):
+    async def _feed_audio_data_with_progress(
+        self,
+        file_source,
+        audio_data,
+        chunk_count,
+        progress,
+        task_ids: list[int] | int,
+        original_stt: "SttStream | None" = None,
+    ):
         """Feed audio data to the source with precise timing and progress updates."""
         ids = task_ids if isinstance(task_ids, list) else [task_ids]
         chunk_duration = SAMPLES_PER_CHUNK / SAMPLERATE
@@ -637,7 +728,9 @@ class AudioFileProcessor:
             chunk = audio_data[start_idx:end_idx]
 
             if len(chunk) < SAMPLES_PER_CHUNK:
-                chunk = np.concatenate([chunk, np.zeros(SAMPLES_PER_CHUNK - len(chunk), dtype=np.int16)])
+                chunk = np.concatenate(
+                    [chunk, np.zeros(SAMPLES_PER_CHUNK - len(chunk), dtype=np.int16)]
+                )
 
             audio_frame = rtc.AudioFrame(
                 data=chunk.tobytes(),
@@ -665,44 +758,54 @@ class AudioFileProcessor:
     def _load_audio_file(self, input_path: Path):
         """Load and preprocess audio file"""
         try:
-            audio_data, sample_rate = sf.read(str(input_path), dtype='int16')
-            
+            audio_data, sample_rate = sf.read(str(input_path), dtype="int16")
+
             if audio_data.ndim == 1:
                 channels = 1
             else:
                 channels = audio_data.shape[1]
-            
+
             duration_s = len(audio_data) / sample_rate
-            
+
             if not self.silent:
-                audio_info = Table(title="🎵 Audio Properties", show_header=True, header_style="bold blue")
+                audio_info = Table(
+                    title="🎵 Audio Properties",
+                    show_header=True,
+                    header_style="bold blue",
+                )
                 audio_info.add_column("Property", style="cyan")
                 audio_info.add_column("Value", style="green")
-                
+
                 audio_info.add_row("Sample Rate", f"{sample_rate:,} Hz")
                 audio_info.add_row("Channels", str(channels))
                 audio_info.add_row("Duration", f"{duration_s:.2f} seconds")
                 audio_info.add_row("Format", input_path.suffix.upper())
-                
+
                 console.print(audio_info)
                 console.print()
-            
+
             audio_array = audio_data
 
             # Resample to 48kHz mono if needed
             if sample_rate != SAMPLERATE or channels != CHANNELS:
                 audio_array = self._resample_audio(audio_array, sample_rate, channels)
                 if not self.silent:
-                    console.print(f"🔄 [yellow]Resampled to: {SAMPLERATE}Hz, {CHANNELS} channel(s)[/yellow]")
+                    console.print(
+                        f"🔄 [yellow]Resampled to: {SAMPLERATE}Hz, {CHANNELS} channel(s)[/yellow]"
+                    )
                     console.print()
-            
+
             return audio_array
-            
+
         except Exception as e:
             if not self.silent:
                 console.print(f"❌ [red]Error loading audio file: {e}[/red]")
-                console.print("[dim]Supported formats: WAV, FLAC, OGG, MP3 (with ffmpeg), M4A, and more[/dim]")
-                console.print("[dim]Make sure you have ffmpeg installed for MP3/M4A support[/dim]")
+                console.print(
+                    "[dim]Supported formats: WAV, FLAC, OGG, MP3 (with ffmpeg), M4A, and more[/dim]"
+                )
+                console.print(
+                    "[dim]Make sure you have ffmpeg installed for MP3/M4A support[/dim]"
+                )
             else:
                 # In silent mode, still show critical errors to stderr
                 sys.stderr.write(f"ERROR: Failed to load audio file - {str(e)}\n")
@@ -717,53 +820,58 @@ class AudioFileProcessor:
             else:
                 stereo = audio_array.reshape(-1, 2)
                 audio_array = stereo.mean(axis=1).astype(np.int16)
-        
+
         # Resample if needed
         if original_rate != SAMPLERATE:
             resampler = rtc.AudioResampler(
                 input_rate=original_rate,
                 output_rate=SAMPLERATE,
                 num_channels=1,
-                quality=rtc.AudioResamplerQuality.VERY_HIGH
+                quality=rtc.AudioResamplerQuality.VERY_HIGH,
             )
-            
+
             input_frame = rtc.AudioFrame(
                 data=audio_array.tobytes(),
                 sample_rate=original_rate,
                 num_channels=1,
-                samples_per_channel=len(audio_array)
+                samples_per_channel=len(audio_array),
             )
-            
+
             output_frames = resampler.push(input_frame)
             output_frames.extend(resampler.flush())
-            
+
             if len(output_frames) > 0:
-                resampled_data = b''.join(frame.data for frame in output_frames)
+                resampled_data = b"".join(frame.data for frame in output_frames)
                 audio_array = np.frombuffer(resampled_data, dtype=np.int16)
             else:
                 if not self.silent:
-                    console.print("⚠️  [yellow]Warning: No output from AudioResampler, using original data[/yellow]")
-        
+                    console.print(
+                        "⚠️  [yellow]Warning: No output from AudioResampler, using original data[/yellow]"
+                    )
+
         return audio_array
 
     def _save_output(self, output_path: Path):
         """Save processed audio frames to output file"""
         if not self.processed_frames:
             if not self.silent:
-                console.print("⚠️  [yellow]Warning: No processed frames to save[/yellow]")
+                console.print(
+                    "⚠️  [yellow]Warning: No processed frames to save[/yellow]"
+                )
             return
-            
-        with wave.open(str(output_path), 'wb') as wav_file:
+
+        with wave.open(str(output_path), "wb") as wav_file:
             wav_file.setnchannels(CHANNELS)
             wav_file.setsampwidth(2)  # 16-bit
             wav_file.setframerate(SAMPLERATE)
-            
+
             for frame_data in self.processed_frames:
                 wav_file.writeframes(frame_data)
 
 
 class FileAudioSource(rtc.AudioSource):
     """Custom audio source that streams from file data"""
+
     def __init__(self, audio_data, sample_rate=SAMPLERATE, num_channels=CHANNELS):
         super().__init__(sample_rate, num_channels)
         self.audio_data = audio_data
@@ -829,7 +937,8 @@ class SttStream:
             while True:
                 try:
                     event = await asyncio.wait_for(
-                        stream_iter.__anext__(), timeout=idle_timeout,
+                        stream_iter.__anext__(),
+                        timeout=idle_timeout,
                     )
                 except asyncio.TimeoutError:
                     break
@@ -876,15 +985,19 @@ def compute_word_alignment(
             else:
                 dp[i][j] = 1 + min(
                     dp[i - 1][j - 1],  # substitution
-                    dp[i][j - 1],       # insertion
-                    dp[i - 1][j],       # deletion
+                    dp[i][j - 1],  # insertion
+                    dp[i - 1][j],  # deletion
                 )
 
     # Backtrace
     alignment: list[tuple[str, str | None, str | None]] = []
     i, j = n, m
     while i > 0 or j > 0:
-        if i > 0 and j > 0 and _normalize_word(ref_words[i - 1]) == _normalize_word(hyp_words[j - 1]):
+        if (
+            i > 0
+            and j > 0
+            and _normalize_word(ref_words[i - 1]) == _normalize_word(hyp_words[j - 1])
+        ):
             alignment.append(("correct", ref_words[i - 1], hyp_words[j - 1]))
             i -= 1
             j -= 1
@@ -1015,7 +1128,7 @@ def generate_transcript_report(
 def setup_logging(log_level: str, silent: bool = False):
     """Setup beautiful Rich logging configuration"""
     level = getattr(logging, log_level.upper())
-    
+
     if silent:
         # For silent mode, still allow WARNING and above to be logged to stderr
         # This helps with debugging while keeping output clean
@@ -1023,7 +1136,7 @@ def setup_logging(log_level: str, silent: bool = False):
             level=logging.WARNING,  # Allow warnings and errors
             format="%(levelname)s: %(message)s",
             handlers=[logging.StreamHandler(sys.stderr)],  # Send to stderr
-            force=True
+            force=True,
         )
     else:
         # Create Rich handler with beautiful formatting
@@ -1033,15 +1146,12 @@ def setup_logging(log_level: str, silent: bool = False):
             show_level=True,
             show_path=False,
             rich_tracebacks=True,
-            tracebacks_suppress=[rtc, api, noise_cancellation, ai_coustics]
+            tracebacks_suppress=[rtc, api, noise_cancellation, ai_coustics],
         )
-        
+
         # Configure logging
         logging.basicConfig(
-            level=level,
-            format="%(message)s",
-            handlers=[rich_handler],
-            force=True
+            level=level, format="%(message)s", handlers=[rich_handler], force=True
         )
 
     # Suppress noisy agent framework / livekit SDK logs — our own logger
@@ -1085,60 +1195,64 @@ def main():
   LIVEKIT_API_KEY: Your LiveKit API key  
   LIVEKIT_API_SECRET: Your LiveKit API secret
         """,
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    
+
+    parser.add_argument("input_file", type=str, help="Path to input audio file")
     parser.add_argument(
-        "input_file",
+        "-o",
+        "--output",
         type=str,
-        help="Path to input audio file"
-    )
-    parser.add_argument(
-        "-o", "--output",
-        type=str,
-        help="Output file path (default: output/<input-file-name>-processed.wav)"
+        help="Output file path (default: output/<input-file-name>-processed.wav)",
     )
     parser.add_argument(
         "--filter",
-        choices=["NC", "BVC", "BVCTelephony", "WebRTC", "aic-quail-l", "aic-quail-vfl", "all"],
+        choices=[
+            "NC",
+            "BVC",
+            "BVCTelephony",
+            "WebRTC",
+            "aic-quail-l",
+            "aic-quail-vfl",
+            "all",
+        ],
         default="NC",
-        help="Noise cancellation filter type (default: NC). 'all' runs every filter and saves separate output files."
+        help="Noise cancellation filter type (default: NC). 'all' runs every filter and saves separate output files.",
     )
     parser.add_argument(
         "--log-level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         default="INFO",
-        help="Set the logging level (default: INFO)"
+        help="Set the logging level (default: INFO)",
     )
     parser.add_argument(
-        "-s", "--silent",
-        action="store_true",
-        help="Suppress all output (silent mode)"
+        "-s", "--silent", action="store_true", help="Suppress all output (silent mode)"
     )
     parser.add_argument(
-        "-t", "--transcript",
+        "-t",
+        "--transcript",
         type=str,
         help="Path to ground-truth transcript file. When provided, the tool "
-             "transcribes both original and processed audio, compares to the "
-             "ground truth, and writes a Markdown report alongside each output."
+        "transcribes both original and processed audio, compares to the "
+        "ground truth, and writes a Markdown report alongside each output.",
     )
     parser.add_argument(
         "--stt",
         type=str,
         default="deepgram/nova-3:en",
         help="LiveKit Inference STT model (default: deepgram/nova-3:en). "
-             "Format: provider/model[:language]"
+        "Format: provider/model[:language]",
     )
 
     args = parser.parse_args()
-    
+
     # Setup console for silent mode
     if args.silent:
         console = NullConsole()
-    
+
     # Setup beautiful logging
     setup_logging(args.log_level, args.silent)
-    
+
     # Check environment with beautiful error messages
     if not os.getenv("LIVEKIT_URL"):
         if not args.silent:
@@ -1147,14 +1261,14 @@ def main():
                 "[dim]LIVEKIT_URL environment variable is required.[/dim]\n"
                 "[dim]Set it to your LiveKit server URL, e.g.:[/dim]\n"
                 "[cyan]export LIVEKIT_URL=wss://your-project.livekit.cloud[/cyan]",
-                style="red"
+                style="red",
             )
             console.print(error_panel)
         else:
             # In silent mode, still show critical errors to stderr
             sys.stderr.write("ERROR: LIVEKIT_URL environment variable is required\n")
         sys.exit(1)
-    
+
     # Validate input file
     input_path = Path(args.input_file)
     if not input_path.exists():
@@ -1169,9 +1283,13 @@ def main():
         transcript_path = Path(args.transcript)
         if not transcript_path.exists():
             if not args.silent:
-                console.print(f"❌ [red]Transcript file '{transcript_path}' does not exist[/red]")
+                console.print(
+                    f"❌ [red]Transcript file '{transcript_path}' does not exist[/red]"
+                )
             else:
-                sys.stderr.write(f"ERROR: Transcript file '{transcript_path}' does not exist\n")
+                sys.stderr.write(
+                    f"ERROR: Transcript file '{transcript_path}' does not exist\n"
+                )
             sys.exit(1)
 
     # Build filter config(s)
@@ -1179,10 +1297,21 @@ def main():
         "NC": lambda: noise_cancellation.NC(),
         "BVC": lambda: noise_cancellation.BVC(),
         "BVCTelephony": lambda: noise_cancellation.BVCTelephony(),
-        "aic-quail-l": lambda: ai_coustics.audio_enhancement(model=EnhancerModel.QUAIL_L),
-        "aic-quail-vfl": lambda: ai_coustics.audio_enhancement(model=EnhancerModel.QUAIL_VF_L),
+        "aic-quail-l": lambda: ai_coustics.audio_enhancement(
+            model=EnhancerModel.QUAIL_L
+        ),
+        "aic-quail-vfl": lambda: ai_coustics.audio_enhancement(
+            model=EnhancerModel.QUAIL_VF_L
+        ),
     }
-    ALL_FILTERS = ["NC", "BVC", "BVCTelephony", "WebRTC", "aic-quail-l", "aic-quail-vfl"]
+    ALL_FILTERS = [
+        "NC",
+        "BVC",
+        "BVCTelephony",
+        "WebRTC",
+        "aic-quail-l",
+        "aic-quail-vfl",
+    ]
     selected = ALL_FILTERS if args.filter == "all" else [args.filter]
 
     filter_configs: list[dict] = []
@@ -1194,20 +1323,24 @@ def main():
         else:
             out = Path(f"output/{input_path.stem}-{fk.lower()}-processed.wav")
         out.parent.mkdir(parents=True, exist_ok=True)
-        filter_configs.append({
-            "filter": fk,
-            "noise_filter": nf,
-            "use_webrtc": use_webrtc,
-            "output": str(out),
-        })
+        filter_configs.append(
+            {
+                "filter": fk,
+                "noise_filter": nf,
+                "use_webrtc": use_webrtc,
+                "output": str(out),
+            }
+        )
 
-    _config.update({
-        "input_file": str(input_path),
-        "filters": filter_configs,
-        "silent": args.silent,
-        "transcript": args.transcript,
-        "stt": args.stt,
-    })
+    _config.update(
+        {
+            "input_file": str(input_path),
+            "filters": filter_configs,
+            "silent": args.silent,
+            "transcript": args.transcript,
+            "stt": args.stt,
+        }
+    )
 
     # Replicate the agents CLI "connect" command: create a real room via the
     # API, then simulate_job(fake_job=False) so the entrypoint gets a genuine
