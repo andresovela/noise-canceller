@@ -4,8 +4,10 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 import sys
 import wave
+from contextlib import nullcontext
 from pathlib import Path
 import numpy as np
 import soundfile as sf
@@ -18,8 +20,9 @@ from rich.panel import Panel
 from rich.table import Table
 
 from livekit import rtc, api
-from livekit.agents import AgentServer, AutoSubscribe, JobContext
+from livekit.agents import AgentServer, AutoSubscribe, JobContext, inference
 from livekit.agents.job import JobExecutorType
+from livekit.agents.stt import SpeechEventType
 from livekit.agents.voice import AgentSession, Agent, room_io, io as voice_io
 from livekit.plugins import noise_cancellation, ai_coustics
 from livekit.plugins.ai_coustics import EnhancerModel
@@ -86,17 +89,24 @@ class CapturingAudioInput(voice_io.AudioInput):
     but we record each one before handing it off.
     """
 
-    def __init__(self, source: voice_io.AudioInput, expected_frames: int) -> None:
+    def __init__(self, source: voice_io.AudioInput, expected_frames: int,
+                 processed_stt: "SttStream | None" = None) -> None:
         super().__init__(label="Capture", source=source)
         self.frames: list[bytes] = []
         self.expected_frames = expected_frames
         self.done = asyncio.Event()
+        self._processed_stt = processed_stt
 
     async def __anext__(self) -> rtc.AudioFrame:
         frame = await super().__anext__()
         self.frames.append(frame.data)
-        if len(self.frames) >= self.expected_frames:
-            self.done.set()
+        if not self.done.is_set():
+            if self._processed_stt is not None:
+                self._processed_stt.push_frame(frame)
+            if len(self.frames) >= self.expected_frames:
+                if self._processed_stt is not None:
+                    self._processed_stt.end_input()
+                self.done.set()
         return frame
 
 
@@ -115,34 +125,147 @@ async def entrypoint(ctx: JobContext):
         filters = _config["filters"]
         silent = _config["silent"]
         input_file = Path(_config["input_file"])
+        ground_truth_file = _config.get("transcript")
+        stt_model = _config.get("stt_model", "deepgram/nova-3:en")
         outputs: list[tuple[str, str]] = []  # (display_name, output_path)
+        processors: list[AudioFileProcessor] = []
 
-        for fc in filters:
-            processor = AudioFileProcessor(
-                room=ctx.room,
-                noise_filter=fc["noise_filter"],
-                filter_key=fc["filter"],
-                use_webrtc=fc["use_webrtc"],
-                silent=silent,
-            )
-            await processor.process_file(input_file, Path(fc["output"]))
-            outputs.append((_filter_display_name(fc["filter"]), fc["output"]))
-
+        # ----- Job summary -----
         if not silent:
-            if len(outputs) == 1:
-                name, path = outputs[0]
-                body = (
-                    "🎉 [bold green]All Done![/bold green]\n"
-                    f"[dim]Your {name} noise-cancelled audio is ready at:[/dim]\n"
-                    f"[cyan]{path}[/cyan]"
-                )
+            filter_names = [_filter_display_name(fc["filter"]) for fc in filters]
+            summary = Table(
+                title="🔊 Job Summary",
+                show_header=False,
+                title_style="bold cyan",
+                border_style="cyan",
+                padding=(0, 1),
+            )
+            summary.add_column("key", style="dim")
+            summary.add_column("value")
+            summary.add_row("Input", str(input_file))
+            if len(filter_names) == 1:
+                summary.add_row("Filter", filter_names[0])
             else:
-                lines = ["🎉 [bold green]All Done![/bold green]"]
-                for name, path in outputs:
-                    lines.append(f"  [dim]{name}:[/dim] [cyan]{path}[/cyan]")
-                body = "\n".join(lines)
+                summary.add_row("Filters", ", ".join(filter_names))
+            if ground_truth_file:
+                summary.add_row("Transcript", ground_truth_file)
+                summary.add_row("STT Model", stt_model)
+            console.print(summary)
+            console.print()
+
+        # ----- Audio processing (+ streaming transcription) -----
+        original_stt_stream: SttStream | None = None
+        processed_stt_streams: list[tuple[dict, SttStream]] = []
+
+        progress_class = NullProgress if silent else Progress
+        with progress_class(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            for i, fc in enumerate(filters):
+                short_name = _filter_short_name(fc["filter"])
+                processor = AudioFileProcessor(
+                    room=ctx.room,
+                    noise_filter=fc["noise_filter"],
+                    filter_key=fc["filter"],
+                    use_webrtc=fc["use_webrtc"],
+                    silent=silent,
+                )
+
+                orig_stream: SttStream | None = None
+                proc_stream: SttStream | None = None
+
+                bar_ids: dict[str, int] = {}
+                bar_ids["feed"] = progress.add_task(
+                    "  📦 Chunking original audio", total=0,
+                )
+                if ground_truth_file and i == 0:
+                    orig_stream = SttStream(stt_model, "orig")
+                    original_stt_stream = orig_stream
+                    bar_ids["orig_stt"] = progress.add_task(
+                        f"  📡 Sending to {stt_model}", total=0,
+                    )
+                bar_ids["nc"] = progress.add_task(
+                    f"  🎤 Sending to {short_name}", total=0,
+                )
+                if ground_truth_file:
+                    filter_name = _filter_display_name(fc["filter"])
+                    proc_stream = SttStream(stt_model, filter_name)
+                    processed_stt_streams.append((fc, proc_stream))
+                    bar_ids["proc_stt"] = progress.add_task(
+                        f"  📡 Sending {short_name} output to {stt_model}", total=0,
+                    )
+
+                await processor.process_file(
+                    input_file, Path(fc["output"]),
+                    progress=progress,
+                    bar_ids=bar_ids,
+                    original_stt=orig_stream,
+                    processed_stt=proc_stream,
+                )
+                outputs.append((_filter_display_name(fc["filter"]), fc["output"]))
+                processors.append(processor)
+
+        # Wait for STT collection to finish (transcripts still arriving
+        # after all chunks have been sent).
+        if ground_truth_file:
+            with console.status("[bold green]Waiting for transcription results…",
+                                spinner="dots"):
+                if original_stt_stream is not None:
+                    await original_stt_stream.result()
+                for _fc, ps in processed_stt_streams:
+                    await ps.result()
+
+        # ----- Results -----
+        if not silent:
+            result_lines: list[str] = []
+            for filter_name, path in outputs:
+                result_lines.append(f"  [dim]{filter_name}:[/dim] [cyan]{path}[/cyan]")
+
+            if ground_truth_file and original_stt_stream is not None:
+                ground_truth = Path(ground_truth_file).read_text().strip()
+                input_transcript = await original_stt_stream.result()
+
+                for fc, proc_stream in processed_stt_streams:
+                    output_transcript = await proc_stream.result()
+                    report = generate_transcript_report(
+                        ground_truth=ground_truth,
+                        input_transcript=input_transcript,
+                        output_transcript=output_transcript,
+                        input_file=str(input_file),
+                        output_file=fc["output"],
+                        filter_name=_filter_display_name(fc["filter"]),
+                        stt_model=stt_model,
+                    )
+                    report_path = Path(fc["output"]).with_suffix(".transcript.md")
+                    report_path.write_text(report)
+                    result_lines.append(
+                        f"  [dim]Transcript:[/dim] [cyan]{report_path}[/cyan]"
+                    )
+
+            body = "🎉 [bold green]All Done![/bold green]\n" + "\n".join(result_lines)
             console.print()
             console.print(Panel.fit(body, style="green"))
+        elif ground_truth_file and original_stt_stream is not None:
+            ground_truth = Path(ground_truth_file).read_text().strip()
+            input_transcript = await original_stt_stream.result()
+            for fc, proc_stream in processed_stt_streams:
+                output_transcript = await proc_stream.result()
+                report = generate_transcript_report(
+                    ground_truth=ground_truth,
+                    input_transcript=input_transcript,
+                    output_transcript=output_transcript,
+                    input_file=str(input_file),
+                    output_file=fc["output"],
+                    filter_name=_filter_display_name(fc["filter"]),
+                    stt_model=stt_model,
+                )
+                report_path = Path(fc["output"]).with_suffix(".transcript.md")
+                report_path.write_text(report)
 
     except Exception as e:
         exit_code = 1
@@ -173,6 +296,18 @@ def _filter_display_name(filter_key: str) -> str:
     }.get(filter_key, filter_key)
 
 
+def _filter_short_name(filter_key: str) -> str:
+    """Short name for progress bar labels."""
+    return {
+        "NC": "Krisp NC",
+        "BVC": "Krisp BVC",
+        "BVCTelephony": "Krisp BVC-T",
+        "WebRTC": "WebRTC",
+        "aic-quail-l": "aic-quail-l",
+        "aic-quail-vfl": "aic-quail-vfl",
+    }.get(filter_key, filter_key)
+
+
 class AudioFileProcessor:
     def __init__(self, room: rtc.Room, noise_filter, filter_key: str, use_webrtc=False, silent=False):
         self.room = room
@@ -180,12 +315,29 @@ class AudioFileProcessor:
         self.filter_key = filter_key
         self.use_webrtc = use_webrtc
         self.processed_frames: list[bytes] = []
+        self.original_audio: np.ndarray | None = None
         self.silent = silent
 
-    async def process_file(self, input_path: Path, output_path: Path):
-        """Process an audio file with LiveKit noise cancellation or WebRTC noise suppression"""
+    async def process_file(self, input_path: Path, output_path: Path, progress=None,
+                           bar_ids: dict[str, int] | None = None,
+                           original_stt: "SttStream | None" = None,
+                           processed_stt: "SttStream | None" = None):
+        """Process an audio file with LiveKit noise cancellation or WebRTC noise suppression.
+
+        When *progress* is an active Rich Progress instance the method adds its
+        tasks to that display instead of creating its own.  ``console.status()``
+        spinners are skipped in that case because they conflict with the live
+        progress display.
+
+        *bar_ids*, when provided, is a dict mapping logical bar names
+        (``"feed"``, ``"nc"``, ``"orig_stt"``, ``"proc_stt"``) to Rich task IDs
+        that were pre-created by the caller.  The processing loops advance these
+        bars directly.
+
+        *original_stt* and *processed_stt*, when provided, receive audio frames
+        in real-time as they flow through the processing pipeline.
+        """
         if not self.silent:
-            # Create beautiful header panel
             display_name = _filter_display_name(self.filter_key)
             header = Panel.fit(
                 f"🎵 [bold cyan]{display_name}[/bold cyan] 🎵\n"
@@ -195,11 +347,10 @@ class AudioFileProcessor:
             console.print(header)
             console.print()
 
-            # Show file info table
             file_info = Table(title="📁 File Information", show_header=True, header_style="bold magenta")
             file_info.add_column("Property", style="cyan")
             file_info.add_column("Value", style="green")
-            
+
             file_info.add_row("Input File", str(input_path))
             file_info.add_row("Output File", str(output_path))
             if self.use_webrtc:
@@ -207,92 +358,120 @@ class AudioFileProcessor:
                 file_info.add_row("Features", "Noise Suppression + Echo Cancellation + High-pass Filter")
             else:
                 file_info.add_row("Processing Type", display_name)
-            
+
             console.print(file_info)
             console.print()
-        
-        # Load the input audio file
-        with console.status("[bold green]Loading audio file...", spinner="dots"):
+
+        if progress is not None:
             audio_data = self._load_audio_file(input_path)
+        else:
+            with console.status("[bold green]Loading audio file...", spinner="dots"):
+                audio_data = self._load_audio_file(input_path)
+        self.original_audio = audio_data
 
         if self.use_webrtc:
-            # Process with WebRTC AudioProcessingModule
-            await self._process_with_webrtc_apm(audio_data)
+            await self._process_with_webrtc_apm(audio_data, progress=progress,
+                                                bar_ids=bar_ids,
+                                                original_stt=original_stt,
+                                                processed_stt=processed_stt)
         else:
-            # Process with LiveKit enhanced noise cancellation
-            await self._process_with_noise_cancellation(audio_data)
-        
-        # Save the processed audio
-        with console.status("[bold green]Saving processed audio...", spinner="dots"):
-            self._save_output(output_path)
-        
-        if not self.silent:
-            # Success message
-            success_panel = Panel.fit(
-                f"✅ [bold green]Processing Complete![/bold green]\n"
-                f"[dim]Clean audio saved to: {output_path}[/dim]",
-                style="green"
-            )
-            console.print(success_panel)
+            await self._process_with_noise_cancellation(audio_data, progress=progress,
+                                                        bar_ids=bar_ids,
+                                                        original_stt=original_stt,
+                                                        processed_stt=processed_stt)
 
-    async def _process_with_webrtc_apm(self, audio_data):
+        if progress is not None:
+            self._save_output(output_path)
+        else:
+            with console.status("[bold green]Saving processed audio...", spinner="dots"):
+                self._save_output(output_path)
+
+    async def _process_with_webrtc_apm(self, audio_data, progress=None,
+                                       bar_ids: dict[str, int] | None = None,
+                                       original_stt: "SttStream | None" = None,
+                                       processed_stt: "SttStream | None" = None):
         """Process audio data using WebRTC AudioProcessingModule"""
         chunk_count = len(audio_data) // SAMPLES_PER_CHUNK
         if len(audio_data) % SAMPLES_PER_CHUNK != 0:
             chunk_count += 1
-        
+
         if not self.silent:
             console.print("🔧 [yellow]Initializing WebRTC AudioProcessingModule...[/yellow]")
-        
-        # Create WebRTC AudioProcessingModule with noise suppression enabled
+
         apm = rtc.AudioProcessingModule(
             noise_suppression=True,
-            echo_cancellation=True,  # Also enable echo cancellation for better results
-            high_pass_filter=True,   # High-pass filter removes low-frequency noise
-            auto_gain_control=False  # Keep gain control disabled for file processing
+            echo_cancellation=True,
+            high_pass_filter=True,
+            auto_gain_control=False,
         )
-        
-        # Process audio in 10ms chunks (required by WebRTC APM)
-        progress_class = NullProgress if self.silent else Progress
-        
-        with progress_class(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            TimeElapsedColumn(),
-            console=console
-        ) as progress:
-            
-            process_task = progress.add_task("🎙️ Processing with WebRTC APM", total=chunk_count)
-            
+
+        if progress is None:
+            progress_class = NullProgress if self.silent else Progress
+            ctx = progress_class(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TimeElapsedColumn(),
+                console=console,
+            )
+        else:
+            ctx = nullcontext(progress)
+
+        ids = bar_ids or {}
+
+        with ctx as prog:
+            if not ids:
+                ids["nc"] = prog.add_task("  🎙️ Processing with WebRTC APM", total=chunk_count)
+            else:
+                for tid in ids.values():
+                    prog.update(tid, total=chunk_count)
+
             for i in range(chunk_count):
                 start_idx = i * SAMPLES_PER_CHUNK
                 end_idx = min(start_idx + SAMPLES_PER_CHUNK, len(audio_data))
                 chunk = audio_data[start_idx:end_idx]
-                
-                # Pad last chunk if necessary with silence
+
                 if len(chunk) < SAMPLES_PER_CHUNK:
                     chunk = np.concatenate([chunk, np.zeros(SAMPLES_PER_CHUNK - len(chunk), dtype=np.int16)])
-                
-                # Create audio frame (WebRTC APM requires exactly 10ms frames)
+
                 audio_frame = rtc.AudioFrame(
                     data=chunk.tobytes(),
                     sample_rate=SAMPLERATE,
                     num_channels=CHANNELS,
-                    samples_per_channel=len(chunk)
+                    samples_per_channel=len(chunk),
                 )
-                
-                # Process frame in-place with WebRTC APM
+
+                if original_stt is not None:
+                    original_stt.push_frame(audio_frame)
+
                 apm.process_stream(audio_frame)
-                # Store processed frame
-                self.processed_frames.append(audio_frame.data.tobytes())
-                # Update progress
-                progress.update(process_task, advance=1)
-            
+                processed_bytes = audio_frame.data.tobytes()
+                self.processed_frames.append(processed_bytes)
+
+                if processed_stt is not None:
+                    processed_frame = rtc.AudioFrame(
+                        data=processed_bytes,
+                        sample_rate=SAMPLERATE,
+                        num_channels=CHANNELS,
+                        samples_per_channel=SAMPLES_PER_CHUNK,
+                    )
+                    processed_stt.push_frame(processed_frame)
+
+                for tid in ids.values():
+                    prog.update(tid, advance=1)
+
+            if original_stt is not None:
+                original_stt.end_input()
+            if processed_stt is not None:
+                processed_stt.end_input()
+
             logger.info(f"Successfully processed {len(self.processed_frames)} frames with WebRTC APM")
 
-    async def _process_with_noise_cancellation(self, audio_data):
+    async def _process_with_noise_cancellation(self, audio_data, progress=None,
+                                                bar_ids: dict[str, int] | None = None,
+                                                original_stt: "SttStream | None" = None,
+                                                processed_stt: "SttStream | None" = None):
         """Process audio data through the LiveKit Agents pipeline with noise cancellation.
 
         Uses a two-connection architecture so that the agents SDK's RoomIO
@@ -311,33 +490,29 @@ class AudioFileProcessor:
 
         publisher_room: rtc.Room | None = None
         session: AgentSession | None = None
+        ids = bar_ids or {}
 
         try:
-            # Step 1: Create a second "publisher" room connection that will
-            # appear as a remote participant to the agent's room.
-            with console.status("[bold yellow]Connecting publisher to LiveKit room...", spinner="dots"):
-                publisher_token = (
-                    api.AccessToken(
-                        os.environ["LIVEKIT_API_KEY"],
-                        os.environ["LIVEKIT_API_SECRET"],
-                    )
-                    .with_identity("file-publisher")
-                    .with_grants(api.VideoGrants(room_join=True, room=self.room.name))
-                    .to_jwt()
+            publisher_token = (
+                api.AccessToken(
+                    os.environ["LIVEKIT_API_KEY"],
+                    os.environ["LIVEKIT_API_SECRET"],
                 )
-                publisher_room = rtc.Room()
-                await publisher_room.connect(os.environ["LIVEKIT_URL"], publisher_token)
-                logger.debug("Publisher connected to room %s", self.room.name)
+                .with_identity("file-publisher")
+                .with_grants(api.VideoGrants(room_join=True, room=self.room.name))
+                .to_jwt()
+            )
+            publisher_room = rtc.Room()
+            await publisher_room.connect(os.environ["LIVEKIT_URL"], publisher_token)
+            logger.debug("Publisher connected to room %s", self.room.name)
 
-            # Step 2: Publish the raw audio track from the publisher connection.
-            with console.status("[bold yellow]Publishing audio track...", spinner="dots"):
-                file_source = FileAudioSource(audio_data, SAMPLERATE, CHANNELS)
-                input_track = rtc.LocalAudioTrack.create_audio_track("raw-input", file_source)
-                pub_options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
-                publication = await publisher_room.local_participant.publish_track(
-                    input_track, pub_options,
-                )
-                await asyncio.sleep(0.5)
+            file_source = FileAudioSource(audio_data, SAMPLERATE, CHANNELS)
+            input_track = rtc.LocalAudioTrack.create_audio_track("raw-input", file_source)
+            pub_options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
+            publication = await publisher_room.local_participant.publish_track(
+                input_track, pub_options,
+            )
+            await asyncio.sleep(0.5)
 
             if not self.silent:
                 if publication:
@@ -348,8 +523,6 @@ class AudioFileProcessor:
                     console.print(f"🏠 [cyan]Room: {self.room.name}[/cyan]")
                     console.print()
 
-            # Step 3: Start an AgentSession whose RoomIO receives the
-            # publisher's audio through the noise-cancellation pipeline.
             session = AgentSession()
             await session.start(
                 agent=Agent(instructions=""),
@@ -368,31 +541,43 @@ class AudioFileProcessor:
                 ),
             )
 
-            # Step 4: Wrap the RoomIO audio input with our capturing wrapper.
-            # _forward_audio_task was just created via asyncio.create_task and
-            # hasn't executed yet — safe to swap before yielding.
             raw_audio_input = session.input.audio
             if raw_audio_input is None:
                 raise RuntimeError("AgentSession did not create an audio input")
-            capturing = CapturingAudioInput(raw_audio_input, expected_frames=chunk_count)
+            capturing = CapturingAudioInput(raw_audio_input, expected_frames=chunk_count,
+                                              processed_stt=processed_stt)
             session.input.audio = capturing
 
-            # Step 5: Feed audio data from the publisher and wait for capture.
-            progress_class = NullProgress if self.silent else Progress
-            with progress_class(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TaskProgressColumn(),
-                TimeElapsedColumn(),
-                console=console,
-            ) as progress:
-                feed_task = progress.add_task("🎤 Feeding audio chunks", total=chunk_count)
-                capture_task = progress.add_task("🔊 Capturing processed audio", total=chunk_count)
+            if progress is None:
+                progress_class = NullProgress if self.silent else Progress
+                ctx = progress_class(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    TaskProgressColumn(),
+                    TimeElapsedColumn(),
+                    console=console,
+                )
+            else:
+                ctx = nullcontext(progress)
+
+            # feed_ids: bars that advance with each input chunk (feed, orig_stt, nc)
+            feed_ids = [v for k, v in ids.items() if k in ("feed", "orig_stt", "nc")]
+            # capture_ids: bars that advance with each processed chunk (proc_stt)
+            capture_ids = [v for k, v in ids.items() if k == "proc_stt"]
+
+            with ctx as prog:
+                if ids:
+                    for tid in ids.values():
+                        prog.update(tid, total=chunk_count)
+                else:
+                    feed_ids = [prog.add_task("  🎤 Feeding audio chunks", total=chunk_count)]
+                    capture_ids = [prog.add_task("  🔊 Capturing processed audio", total=chunk_count)]
 
                 async def _feed():
                     await self._feed_audio_data_with_progress(
-                        file_source, audio_data, chunk_count, progress, feed_task,
+                        file_source, audio_data, chunk_count, prog, feed_ids,
+                        original_stt=original_stt,
                     )
 
                 async def _wait_capture():
@@ -401,11 +586,14 @@ class AudioFileProcessor:
                         await asyncio.sleep(0.05)
                         new_count = len(capturing.frames)
                         if new_count > last_count:
-                            progress.update(capture_task, advance=new_count - last_count)
+                            delta = new_count - last_count
+                            for tid in capture_ids:
+                                prog.update(tid, advance=delta)
                             last_count = new_count
-                    # Final update
                     if last_count < len(capturing.frames):
-                        progress.update(capture_task, advance=len(capturing.frames) - last_count)
+                        delta = len(capturing.frames) - last_count
+                        for tid in capture_ids:
+                            prog.update(tid, advance=delta)
 
                 try:
                     await asyncio.wait_for(
@@ -434,36 +622,45 @@ class AudioFileProcessor:
                 except Exception as e:
                     logger.debug("Publisher disconnect: %s", e)
 
-    async def _feed_audio_data_with_progress(self, file_source, audio_data, chunk_count, progress, task_id):
-        """Feed audio data to the source with precise timing and progress updates"""
+    async def _feed_audio_data_with_progress(self, file_source, audio_data, chunk_count,
+                                              progress, task_ids: list[int] | int,
+                                              original_stt: "SttStream | None" = None):
+        """Feed audio data to the source with precise timing and progress updates."""
+        ids = task_ids if isinstance(task_ids, list) else [task_ids]
         chunk_duration = SAMPLES_PER_CHUNK / SAMPLERATE
         loop = asyncio.get_running_loop()
         start_time = loop.time()
-        
+
         for i in range(chunk_count):
             start_idx = i * SAMPLES_PER_CHUNK
             end_idx = min(start_idx + SAMPLES_PER_CHUNK, len(audio_data))
             chunk = audio_data[start_idx:end_idx]
-            
+
             if len(chunk) < SAMPLES_PER_CHUNK:
                 chunk = np.concatenate([chunk, np.zeros(SAMPLES_PER_CHUNK - len(chunk), dtype=np.int16)])
-            
+
             audio_frame = rtc.AudioFrame(
                 data=chunk.tobytes(),
                 sample_rate=SAMPLERATE,
                 num_channels=CHANNELS,
-                samples_per_channel=len(chunk)
+                samples_per_channel=len(chunk),
             )
-            
+
             await file_source.capture_frame(audio_frame)
-            progress.update(task_id, advance=1)
-            
+            if original_stt is not None:
+                original_stt.push_frame(audio_frame)
+            for tid in ids:
+                progress.update(tid, advance=1)
+
             target_time = start_time + (i + 1) * chunk_duration
             current_time = loop.time()
             delay = max(0, target_time - current_time)
-            
+
             if delay > 0:
                 await asyncio.sleep(delay)
+
+        if original_stt is not None:
+            original_stt.end_input()
 
     def _load_audio_file(self, input_path: Path):
         """Load and preprocess audio file"""
@@ -572,6 +769,249 @@ class FileAudioSource(rtc.AudioSource):
         self.audio_data = audio_data
 
 
+# ---------------------------------------------------------------------------
+# Transcription & word-error-rate helpers
+# ---------------------------------------------------------------------------
+
+
+class SttStream:
+    """Wraps a LiveKit ``inference.STT`` streaming session so that callers
+    can push frames one at a time (from any chunk loop) rather than feeding
+    a complete numpy array after the fact.
+
+    Usage::
+
+        stream = SttStream("deepgram/nova-3:en", label="Original audio → STT")
+        # … in your chunk loop:
+        stream.push_frame(audio_frame)
+        # … when done:
+        stream.end_input()
+        text = await stream.result()
+    """
+
+    def __init__(self, stt_model: str, label: str, total_chunks: int = 0):
+        self.label = label
+        self.total_chunks = total_chunks
+        self.chunks_sent = 0
+        self.words = 0
+        self.sending_done = False
+        self.done = False
+
+        self._stt = inference.STT(model=stt_model)
+        self._stream = self._stt.stream()
+        self._transcripts: list[str] = []
+        self._collect_task = asyncio.create_task(self._collect())
+
+    def push_frame(self, frame: rtc.AudioFrame) -> None:
+        self._stream.push_frame(frame)
+        self.chunks_sent += 1
+
+    def end_input(self) -> None:
+        self._stream.end_input()
+        self.sending_done = True
+
+    async def result(self, timeout: float = 120.0) -> str:
+        """Wait for collection to finish and return the full transcript."""
+        try:
+            await asyncio.wait_for(self._collect_task, timeout=timeout)
+        except asyncio.TimeoutError:
+            self._collect_task.cancel()
+            try:
+                await self._collect_task
+            except asyncio.CancelledError:
+                pass
+        return " ".join(self._transcripts)
+
+    async def _collect(self) -> None:
+        try:
+            idle_timeout = 10.0
+            stream_iter = self._stream.__aiter__()
+            while True:
+                try:
+                    event = await asyncio.wait_for(
+                        stream_iter.__anext__(), timeout=idle_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    break
+                except StopAsyncIteration:
+                    break
+                if event.type == SpeechEventType.FINAL_TRANSCRIPT:
+                    if event.alternatives and event.alternatives[0].text:
+                        text = event.alternatives[0].text
+                        self._transcripts.append(text)
+                        self.words += len(text.split())
+        finally:
+            await self._stream.aclose()
+            self.done = True
+
+
+def _normalize_word(word: str) -> str:
+    """Lowercase and strip non-alphanumeric characters for comparison."""
+    return re.sub(r"[^\w]", "", word.lower())
+
+
+def compute_word_alignment(
+    reference: str,
+    hypothesis: str,
+) -> list[tuple[str, str | None, str | None]]:
+    """Word-level alignment via minimum edit distance.
+
+    Returns [(operation, ref_word, hyp_word), ...] where *operation* is one of
+    ``'correct'``, ``'substitution'``, ``'insertion'``, or ``'deletion'``.
+    """
+    ref_words = reference.split()
+    hyp_words = hypothesis.split()
+    n, m = len(ref_words), len(hyp_words)
+
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n + 1):
+        dp[i][0] = i
+    for j in range(m + 1):
+        dp[0][j] = j
+
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            if _normalize_word(ref_words[i - 1]) == _normalize_word(hyp_words[j - 1]):
+                dp[i][j] = dp[i - 1][j - 1]
+            else:
+                dp[i][j] = 1 + min(
+                    dp[i - 1][j - 1],  # substitution
+                    dp[i][j - 1],       # insertion
+                    dp[i - 1][j],       # deletion
+                )
+
+    # Backtrace
+    alignment: list[tuple[str, str | None, str | None]] = []
+    i, j = n, m
+    while i > 0 or j > 0:
+        if i > 0 and j > 0 and _normalize_word(ref_words[i - 1]) == _normalize_word(hyp_words[j - 1]):
+            alignment.append(("correct", ref_words[i - 1], hyp_words[j - 1]))
+            i -= 1
+            j -= 1
+        elif i > 0 and j > 0 and dp[i][j] == dp[i - 1][j - 1] + 1:
+            alignment.append(("substitution", ref_words[i - 1], hyp_words[j - 1]))
+            i -= 1
+            j -= 1
+        elif j > 0 and dp[i][j] == dp[i][j - 1] + 1:
+            alignment.append(("insertion", None, hyp_words[j - 1]))
+            j -= 1
+        elif i > 0:
+            alignment.append(("deletion", ref_words[i - 1], None))
+            i -= 1
+        else:
+            break
+
+    alignment.reverse()
+    return alignment
+
+
+def format_annotated_transcript(
+    alignment: list[tuple[str, str | None, str | None]],
+) -> str:
+    """Render an alignment as a Markdown string with error markers.
+
+    * ~~word~~              — deletion  (in ground truth but not transcribed)
+    * **word**              — insertion (transcribed but not in ground truth)
+    * ~~expected~~**actual** — substitution (no space between)
+    """
+    parts: list[str] = []
+    for op, ref, hyp in alignment:
+        if op == "correct":
+            parts.append(hyp)  # type: ignore[arg-type]
+        elif op == "substitution":
+            parts.append(f"~~{ref}~~**{hyp}**")
+        elif op == "insertion":
+            parts.append(f"**{hyp}**")
+        elif op == "deletion":
+            parts.append(f"~~{ref}~~")
+    return " ".join(parts)
+
+
+def _alignment_error_counts(
+    alignment: list[tuple[str, str | None, str | None]],
+) -> tuple[int, int, int]:
+    """Return (substitutions, insertions, deletions) from an alignment."""
+    subs = sum(1 for op, _, _ in alignment if op == "substitution")
+    ins = sum(1 for op, _, _ in alignment if op == "insertion")
+    dels = sum(1 for op, _, _ in alignment if op == "deletion")
+    return subs, ins, dels
+
+
+def generate_transcript_report(
+    ground_truth: str,
+    input_transcript: str,
+    output_transcript: str,
+    input_file: str,
+    output_file: str,
+    filter_name: str,
+    stt_model: str,
+) -> str:
+    """Build a Markdown report comparing pre- and post-processed transcriptions."""
+    in_align = compute_word_alignment(ground_truth, input_transcript)
+    out_align = compute_word_alignment(ground_truth, output_transcript)
+
+    ref_words = len(ground_truth.split())
+    in_s, in_i, in_d = _alignment_error_counts(in_align)
+    out_s, out_i, out_d = _alignment_error_counts(out_align)
+    in_total = in_s + in_i + in_d
+    out_total = out_s + out_i + out_d
+    in_wer = (in_total / ref_words * 100) if ref_words else 0.0
+    out_wer = (out_total / ref_words * 100) if ref_words else 0.0
+
+    in_annotated = format_annotated_transcript(in_align)
+    out_annotated = format_annotated_transcript(out_align)
+
+    return f"""\
+# Transcription Report
+
+| | |
+|---|---|
+| **Input** | `{input_file}` |
+| **Output** | `{output_file}` |
+| **Filter** | {filter_name} |
+| **STT Model** | `{stt_model}` |
+
+## Metrics
+
+| Metric | Original | After {filter_name} |
+|--------|----------|------|
+| Word Error Rate (WER) | {in_wer:.1f}% | {out_wer:.1f}% |
+| Substitutions | {in_s} | {out_s} |
+| Insertions | {in_i} | {out_i} |
+| Deletions | {in_d} | {out_d} |
+| Total Errors | {in_total} | {out_total} |
+| Reference Words | {ref_words} | {ref_words} |
+
+## Error Legend
+
+| Syntax | Meaning |
+|--------|---------|
+| ~~word~~ | Missing word (in ground truth but not transcribed) |
+| **word** | Extra word (transcribed but not in ground truth) |
+| ~~expected~~**actual** | Wrong word (substitution) |
+
+## Ground Truth
+
+{ground_truth}
+
+## Original Transcription
+
+{input_transcript}
+
+### Diff
+
+{in_annotated}
+
+## After {filter_name}
+
+{output_transcript}
+
+### Diff
+
+{out_annotated}
+"""
+
+
 def setup_logging(log_level: str, silent: bool = False):
     """Setup beautiful Rich logging configuration"""
     level = getattr(logging, log_level.upper())
@@ -633,6 +1073,8 @@ def main():
   uv run noise-canceller.py audio.m4a --filter aic-quail-vfl
   uv run noise-canceller.py audio.m4a --filter all
   uv run noise-canceller.py audio.m4a -o processed.wav --silent
+  uv run noise-canceller.py input.wav -t ground_truth.txt
+  uv run noise-canceller.py input.wav -t ground_truth.txt --stt-model deepgram/nova-3:en
   
 📁 Supported formats: MP3, WAV, FLAC, OGG, M4A, AAC, AIFF, and more
 📝 Note: Some formats may require ffmpeg to be installed
@@ -673,6 +1115,20 @@ def main():
         action="store_true",
         help="Suppress all output (silent mode)"
     )
+    parser.add_argument(
+        "-t", "--transcript",
+        type=str,
+        help="Path to ground-truth transcript file. When provided, the tool "
+             "transcribes both original and processed audio, compares to the "
+             "ground truth, and writes a Markdown report alongside each output."
+    )
+    parser.add_argument(
+        "--stt-model",
+        type=str,
+        default="deepgram/nova-3:en",
+        help="LiveKit Inference STT model (default: deepgram/nova-3:en). "
+             "Format: provider/model[:language]"
+    )
 
     args = parser.parse_args()
     
@@ -707,7 +1163,17 @@ def main():
         else:
             sys.stderr.write(f"ERROR: Input file '{input_path}' does not exist\n")
         sys.exit(1)
-    
+
+    # Validate transcript file if provided
+    if args.transcript:
+        transcript_path = Path(args.transcript)
+        if not transcript_path.exists():
+            if not args.silent:
+                console.print(f"❌ [red]Transcript file '{transcript_path}' does not exist[/red]")
+            else:
+                sys.stderr.write(f"ERROR: Transcript file '{transcript_path}' does not exist\n")
+            sys.exit(1)
+
     # Build filter config(s)
     filter_map = {
         "NC": lambda: noise_cancellation.NC(),
@@ -739,6 +1205,8 @@ def main():
         "input_file": str(input_path),
         "filters": filter_configs,
         "silent": args.silent,
+        "transcript": args.transcript,
+        "stt_model": args.stt_model,
     })
 
     # Replicate the agents CLI "connect" command: create a real room via the
