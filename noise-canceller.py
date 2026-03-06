@@ -1312,19 +1312,17 @@ def main():
         kwargs = {"model": model}
 
         # Forward enhancement-level only when requested and when the plugin
-        # version supports ModelParameter.ENHANCEMENT_LEVEL.
+        # version supports ModelParameters(enhancement_level=...).
         if args.enhancement_level is not None:
-            model_parameter = getattr(ai_coustics, "ModelParameter", None)
-            if model_parameter is not None and hasattr(
-                model_parameter, "ENHANCEMENT_LEVEL"
-            ):
-                kwargs["model_parameters"] = {
-                    model_parameter.ENHANCEMENT_LEVEL: args.enhancement_level
-                }
+            model_parameters = getattr(ai_coustics, "ModelParameters", None)
+            if model_parameters is not None:
+                kwargs["model_parameters"] = model_parameters(
+                    enhancement_level=args.enhancement_level
+                )
             elif not args.silent:
                 console.print(
                     "⚠️  [yellow]Ignoring --enhancement-level: installed ai-coustics "
-                    "plugin does not support ENHANCEMENT_LEVEL yet[/yellow]"
+                    "plugin does not support ModelParameters yet[/yellow]"
                 )
 
         return ai_coustics.audio_enhancement(**kwargs)
