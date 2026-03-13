@@ -1432,10 +1432,10 @@ def main():
     if args.ai_coustics_enhancement_level is not None and not (0.0 <= args.ai_coustics_enhancement_level <= 1.0):
         if not args.silent:
             console.print(
-                "❌ [red]--enhancement-level must be between 0.0 and 1.0[/red]"
+                "❌ [red]--ai-coustics-enhancement-level must be between 0.0 and 1.0[/red]"
             )
         else:
-            sys.stderr.write("ERROR: --enhancement-level must be between 0.0 and 1.0\n")
+            sys.stderr.write("ERROR: --ai-coustics-enhancement-level must be between 0.0 and 1.0\n")
         sys.exit(1)
 
     def build_ai_coustics_filter(model: EnhancerModel):
@@ -1451,7 +1451,7 @@ def main():
                 )
             elif not args.silent:
                 console.print(
-                    "⚠️  [yellow]Ignoring --enhancement-level: installed ai-coustics "
+                    "⚠️  [yellow]Ignoring --ai-coustics-enhancement-level: installed ai-coustics "
                     "plugin does not support ModelParameters yet[/yellow]"
                 )
 
