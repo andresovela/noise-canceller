@@ -1345,7 +1345,7 @@ def main():
         "Format: provider/model[:language]",
     )
     parser.add_argument(
-        "--enhancement-level",
+        "--ai-coustics-enhancement-level",
         type=float,
         help="Optional ai-coustics enhancement level (0.0-1.0). "
         "Only applied to ai-coustics filters.",
@@ -1429,7 +1429,7 @@ def main():
             sys.exit(1)
 
     # Validate enhancement level if provided
-    if args.enhancement_level is not None and not (0.0 <= args.enhancement_level <= 1.0):
+    if args.ai_coustics_enhancement_level is not None and not (0.0 <= args.ai_coustics_enhancement_level <= 1.0):
         if not args.silent:
             console.print(
                 "❌ [red]--enhancement-level must be between 0.0 and 1.0[/red]"
@@ -1443,11 +1443,11 @@ def main():
 
         # Forward enhancement-level only when requested and when the plugin
         # version supports ModelParameters(enhancement_level=...).
-        if args.enhancement_level is not None:
+        if args.ai_coustics_enhancement_level is not None:
             model_parameters = getattr(ai_coustics, "ModelParameters", None)
             if model_parameters is not None:
                 kwargs["model_parameters"] = model_parameters(
-                    enhancement_level=args.enhancement_level
+                    enhancement_level=args.ai_coustics_enhancement_level
                 )
             elif not args.silent:
                 console.print(
